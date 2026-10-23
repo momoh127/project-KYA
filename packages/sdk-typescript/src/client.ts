@@ -1,4 +1,5 @@
-import { signRequest } from '@agenttrust/identity';
+import { generateKeyPairSync, type KeyObject } from 'node:crypto';
+import { ed25519Sign, parseEd25519PrivateKey, signRequest, signRequestWith, type SignFn } from '@agenttrust/identity';
 import type {
   ApiErrorBody,
   AuthorizationResponse,
@@ -6,6 +7,18 @@ import type {
   ExecuteTransactionInput,
   TransactionResponse,
 } from './types';
+
+export type { SignFn };
+
+/**
+ * DEVELOPMENT ONLY: signs with a workload key held in this process. In
+ * production, pass a SignFn that calls a sidecar, OS keystore or KMS/HSM, so
+ * the long-lived key is never in memory that the LLM/tool layer can reach.
+ */
+export function localSigner(privateKeyPem: string): SignFn {
+  const key = parseEd25519PrivateKey(privateKeyPem);
+  return (data: Buffer) => ed25519Sign(key, data);
+}
 
 export class AgentTrustError extends Error {
   constructor(
@@ -34,36 +47,90 @@ async function send<T>(fetchFn: FetchFn, url: string, init: RequestInit): Promis
 
 export interface AgentClientOptions {
   baseUrl: string;
+  /** Workload credential id (`akc_…`). */
   credentialId: string;
-  /** Agent private key. Keep it in the agent runtime / secret store, never in an LLM prompt. */
-  privateKeyPem: string;
+  /**
+   * Signs with the long-lived WORKLOAD key. That key can only mint short-lived
+   * sessions. Keep it outside the LLM-accessible environment (sidecar / KMS).
+   */
+  workloadSigner?: SignFn;
+  /** Convenience for local development; equivalent to `workloadSigner: localSigner(pem)`. */
+  privateKeyPem?: string;
+  /** Session lifetime requested from the server (60–3600 s, default 900). */
+  sessionTtlSeconds?: number;
   fetch?: FetchFn;
 }
 
+interface Session {
+  id: string;
+  key: KeyObject;
+  expiresAt: number;
+}
+
 /**
- * Client used by an AI agent's runtime. Every call is signed with the agent's
- * Ed25519 key. The agent never holds payment credentials: the only way to pay
- * is `transactions.execute`, which the AgentTrust gateway enforces.
+ * Client used by an AI agent's runtime (NOT by the LLM itself: expose only
+ * high-level tools such as "request purchase authorization" to the model).
+ *
+ * Every API call is signed with a short-lived SESSION key (in-memory, never
+ * exported) that is minted by the workload credential and rotated before it
+ * expires. The agent never holds payment credentials: the only way to pay is
+ * `transactions.execute`, which the AgentTrust gateway enforces.
  */
 export class AgentTrust {
   private readonly fetchFn: FetchFn;
+  private readonly workloadSigner: SignFn;
+  private session: Session | null = null;
+  private sessionPromise: Promise<Session> | null = null;
 
   constructor(private readonly opts: AgentClientOptions) {
     this.fetchFn = opts.fetch ?? fetch;
+    const signer = opts.workloadSigner ?? (opts.privateKeyPem ? localSigner(opts.privateKeyPem) : null);
+    if (!signer) throw new Error('AgentTrust: provide workloadSigner (or privateKeyPem for local development)');
+    this.workloadSigner = signer;
   }
 
-  private request<T>(method: 'GET' | 'POST', path: string, payload?: unknown): Promise<T> {
-    const body = payload === undefined ? '' : JSON.stringify(payload);
-    const headers: Record<string, string> = signRequest({
-      credentialId: this.opts.credentialId,
-      privateKeyPem: this.opts.privateKeyPem,
-      method,
-      path,
+  private async ensureSession(): Promise<Session> {
+    if (this.session && this.session.expiresAt - Date.now() > 60_000) return this.session;
+    this.sessionPromise ??= this.createSession().finally(() => {
+      this.sessionPromise = null;
+    });
+    return this.sessionPromise;
+  }
+
+  private async createSession(): Promise<Session> {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const path = '/v1/agent-sessions';
+    const body = JSON.stringify({
+      publicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+      ttlSeconds: this.opts.sessionTtlSeconds ?? 900,
+    });
+    const headers = await signRequestWith({ credentialId: this.opts.credentialId, sign: this.workloadSigner, method: 'POST', path, body });
+    const res = await send<{ sessionId: string; expiresAt: string }>(this.fetchFn, `${this.opts.baseUrl}${path}`, {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json' },
       body,
     });
+    this.session = { id: res.sessionId, key: privateKey, expiresAt: Date.parse(res.expiresAt) };
+    return this.session;
+  }
+
+  private async request<T>(method: 'GET' | 'POST', path: string, payload?: unknown): Promise<T> {
+    const session = await this.ensureSession();
+    const body = payload === undefined ? '' : JSON.stringify(payload);
+    const headers: Record<string, string> = signRequest({ credentialId: session.id, privateKeyPem: session.key, method, path, body });
     if (body) headers['content-type'] = 'application/json';
     return send<T>(this.fetchFn, `${this.opts.baseUrl}${path}`, { method, headers, body: body || undefined });
   }
+
+  readonly sessions = {
+    /** Current session id (creates one if needed). */
+    current: async () => (await this.ensureSession()).id,
+    /** Force a fresh session key now (e.g. after suspected exposure). */
+    rotate: async () => {
+      this.session = null;
+      return (await this.ensureSession()).id;
+    },
+  };
 
   readonly authorizations = {
     create: (input: CreateAuthorizationInput) =>
@@ -133,5 +200,19 @@ export class AgentTrustPlatform {
   /** Development only. The server refuses this in production. */
   devToken(userId: string) {
     return this.post<{ accessToken: string; expiresAt: string }>('/v1/dev/token', { userId });
+  }
+
+  /** Development only: queue sandbox payment-provider faults (FIFO). */
+  sandboxFaults(faults: string[]) {
+    return this.post<{ queued: string[] }>('/v1/dev/sandbox/faults', { faults });
+  }
+
+  /** Development only: the sandbox provider's own ledger for an idempotency key. */
+  async sandboxLedger(idempotencyKey: string) {
+    return send<{ payments: { idempotencyKey: string; status: string; amountCents: number; providerReference: string }[] }>(
+      this.fetchFn,
+      `${this.opts.baseUrl}/v1/dev/sandbox/payments/${encodeURIComponent(idempotencyKey)}`,
+      { headers: { 'x-agenttrust-bootstrap-token': this.opts.bootstrapToken } },
+    );
   }
 }

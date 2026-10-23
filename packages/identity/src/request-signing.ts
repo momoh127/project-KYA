@@ -66,6 +66,27 @@ export function signRequest(input: SignRequestInput): Record<string, string> {
   };
 }
 
+/**
+ * Signing callback. Lets the private key live outside the agent/LLM process
+ * (sidecar, OS keychain, KMS/HSM): the caller hands over bytes, gets a signature.
+ */
+export type SignFn = (data: Buffer) => Buffer | Promise<Buffer>;
+
+export async function signRequestWith(
+  input: Omit<SignRequestInput, 'privateKeyPem'> & { sign: SignFn },
+): Promise<Record<string, string>> {
+  const timestamp = String(Math.floor((input.now ?? new Date()).getTime() / 1000));
+  const nonce = input.nonce ?? randomBytes(16).toString('hex');
+  const toSign = buildStringToSign({ method: input.method, path: input.path, timestamp, nonce, bodySha256: sha256Hex(input.body) });
+  const signature = await input.sign(Buffer.from(toSign, 'utf8'));
+  return {
+    [Headers.credential]: input.credentialId,
+    [Headers.timestamp]: timestamp,
+    [Headers.nonce]: nonce,
+    [Headers.signature]: base64UrlEncode(signature),
+  };
+}
+
 export interface ParsedSignatureHeaders {
   credentialId: string;
   timestamp: number;
@@ -83,7 +104,7 @@ export function parseSignatureHeaders(get: (name: string) => string | undefined)
   const nonce = get(Headers.nonce);
   const sig = get(Headers.signature);
   if (!credentialId || !ts || !nonce || !sig) return { ok: false, reason: 'missing signature headers' };
-  if (!/^akc_[a-f0-9]{32}$/.test(credentialId)) return { ok: false, reason: 'malformed credential id' };
+  if (!/^(akc|ags)_[a-f0-9]{32}$/.test(credentialId)) return { ok: false, reason: 'malformed credential id' };
   if (!/^\d{1,12}$/.test(ts)) return { ok: false, reason: 'malformed timestamp' };
   if (!/^[A-Za-z0-9_-]{16,128}$/.test(nonce)) return { ok: false, reason: 'malformed nonce' };
   let signature: Buffer;

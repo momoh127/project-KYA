@@ -1,6 +1,6 @@
 # ADR-0002: Identity, authorization tokens and enforcement
 
-- **Status:** Accepted
+- **Status:** Accepted; partially superseded by [ADR-0003](0003-hardening.md) (workload credentials + sessions, complete binding, payment state machine, graded security responses)
 - **Date:** 2026-10-22
 
 ## Context

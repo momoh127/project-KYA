@@ -11,6 +11,8 @@ export type PaymentDestination =
 
 export interface NormalizedPaymentDestination {
   type: PaymentDestination['type'];
+  /** Payment rail implied by the destination type. Bound into authorizations. */
+  rail: 'ach' | 'sepa';
   value: Record<string, string>;
   last4: string;
 }
@@ -23,12 +25,12 @@ export function normalizePaymentDestination(dest: PaymentDestination): Normalize
     const accountNumber = digitsOnly(dest.accountNumber);
     if (!/^\d{9}$/.test(routingNumber)) throw new RangeError('routingNumber must be 9 digits');
     if (!/^\d{4,17}$/.test(accountNumber)) throw new RangeError('accountNumber must be 4-17 digits');
-    return { type: 'us_ach', value: { routingNumber, accountNumber }, last4: accountNumber.slice(-4) };
+    return { type: 'us_ach', rail: 'ach', value: { routingNumber, accountNumber }, last4: accountNumber.slice(-4) };
   }
   if (dest.type === 'iban') {
     const iban = dest.iban.replace(/\s/g, '').toUpperCase();
     if (!/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/.test(iban)) throw new RangeError('invalid IBAN format');
-    return { type: 'iban', value: { iban }, last4: iban.slice(-4) };
+    return { type: 'iban', rail: 'sepa', value: { iban }, last4: iban.slice(-4) };
   }
   throw new RangeError('unsupported payment destination type');
 }
@@ -63,6 +65,7 @@ export interface TransactionIntent {
 
 export const TRANSACTION_FINGERPRINT_VERSION = 1;
 
+/** Fingerprint of the agent's REQUEST (used for idempotency). */
 export function transactionFingerprint(intent: TransactionIntent): string {
   const material = canonicalJson({
     v: TRANSACTION_FINGERPRINT_VERSION,
@@ -77,4 +80,47 @@ export function transactionFingerprint(intent: TransactionIntent): string {
     invoiceId: intent.invoiceId,
   });
   return `tx_${sha256Hex(material)}`;
+}
+
+/**
+ * The COMPLETE payment instruction an authorization permits. On top of the
+ * request it binds the execution details resolved from trusted records and
+ * the exact versions of the authority that allowed it. If the supplier record,
+ * policy or delegation changes before execution, the fingerprint recomputed
+ * at the gateway no longer matches and payment is refused.
+ */
+export interface AuthorizationBinding extends TransactionIntent {
+  /** e.g. "ach", "sepa". */
+  paymentRail: string;
+  /** Provider-side destination identifier from the verified supplier record. */
+  destinationRef: string;
+  supplierVersion: number;
+  policyId: string;
+  policyVersion: number;
+  /** Delegations are immutable grants (changes create a new id), so the id is the version. */
+  delegationId: string;
+}
+
+export const AUTHORIZATION_FINGERPRINT_VERSION = 2;
+
+export function authorizationFingerprint(b: AuthorizationBinding): string {
+  const material = canonicalJson({
+    v: AUTHORIZATION_FINGERPRINT_VERSION,
+    organizationId: b.organizationId,
+    agentId: b.agentId,
+    action: b.action,
+    supplierId: b.supplierId,
+    supplierVersion: b.supplierVersion,
+    paymentRail: b.paymentRail,
+    destinationRef: b.destinationRef,
+    paymentDestinationFingerprint: b.paymentDestinationFingerprint,
+    amountCents: b.amountCents,
+    currency: b.currency,
+    purchaseOrderId: b.purchaseOrderId,
+    invoiceId: b.invoiceId,
+    policyId: b.policyId,
+    policyVersion: b.policyVersion,
+    delegationId: b.delegationId,
+  });
+  return `az_${sha256Hex(material)}`;
 }

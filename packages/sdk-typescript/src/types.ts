@@ -8,7 +8,8 @@ export type AuthorizationStatus =
   | 'denied'
   | 'rejected'
   | 'consumed'
-  | 'expired';
+  | 'expired'
+  | 'invalidated';
 
 export interface CreateAuthorizationInput {
   /** Required. Retrying with the same key returns the same authorization. */
@@ -33,6 +34,11 @@ export interface AuthorizationResponse {
   approvable: boolean;
   policyVersion: number | null;
   transactionFingerprint: string;
+  /** Fingerprint of the complete payment instruction (rail, destination, record versions, policy, delegation). */
+  authorizationFingerprint: string | null;
+  supplierVersion: number | null;
+  paymentRail: string | null;
+  invalidatedReason: string | null;
   amountCents: number;
   currency: string;
   supplierId: string | null;
@@ -59,13 +65,23 @@ export interface ExecuteTransactionInput {
 export interface TransactionResponse {
   id: string;
   authorizationId: string;
-  status: 'pending' | 'succeeded' | 'failed';
+  /**
+   * succeeded / failed are final. unknown / executing / reconciliation_required
+   * mean the outcome is NOT known yet: never treat these as failure and never
+   * request a new authorization to "try again". Retry execute with the same
+   * token (it reconciles, never re-pays) or poll.
+   */
+  status: 'executing' | 'succeeded' | 'failed' | 'unknown' | 'reconciliation_required';
   amountCents: number;
   currency: string;
   supplierId: string | null;
   invoiceId: string | null;
   provider: string;
+  providerIdempotencyKey: string;
   providerReference: string | null;
+  attempts: number;
+  /** True when this response came from reconciling an earlier attempt (no new payment was sent blindly). */
+  retried?: boolean;
   createdAt: string;
 }
 

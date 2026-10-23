@@ -1,89 +1,119 @@
 # Architecture
 
-## Core principle: prevention, not detection
+## Core principle: enforce at the payment boundary
 
-AgentTrust does not try to guess whether an agent is behaving badly. It removes the agent's ability to move
-money on its own. The agent can only **request** an authorization; a deterministic engine checks the request
-against records humans control; and a gateway that alone holds payment credentials **enforces** the decision.
-A circuit breaker adds detection as a backstop.
+AgentTrust doesn't try to guess whether an agent is behaving badly. It removes the agent's ability to move
+money on its own **through the paths AgentTrust controls**. The agent can only **request** an authorization. A
+deterministic engine checks the request against records humans control, and a gateway that alone holds payment
+credentials **enforces** the decision and reconciles every uncertain outcome with the provider. Graded security
+monitoring adds detection as a backstop.
+
+> AgentTrust can only enforce what flows through its gateway. Customers must not give agents any other payment
+> credential or tool.
 
 ## Components
 
 ```mermaid
 flowchart TD
-    H["Humans (admin / approver / member)<br/>OIDC login (dev issuer locally)"] -->|"configure truth"| API
-    A["AI agent runtime<br/>Ed25519 key, no payment credentials"] -->|"signed POST /v1/authorizations"| API["AgentTrust API (NestJS)"]
-    API --> G["AuthGuard<br/>fail-closed, identity from credentials only"]
+    H["Humans (admin / approver / member)<br/>OIDC login, step-up for sensitive actions"] -->|"configure truth"| API
+    W["Workload key<br/>(sidecar / KMS, outside the LLM)"] -->|"mint 15-min session"| API
+    A["AI agent runtime<br/>session key, no payment credentials"] -->|"session-signed requests"| API["AgentTrust API (NestJS)"]
+    API --> G["AuthGuard<br/>fail-closed; workload vs session keys"]
     G --> AS["AuthorizationsService"]
     AS --> FL["FactsLoader<br/>row locks, org-scoped reads"]
     FL --> DB[("PostgreSQL")]
     AS --> PE["policy-engine<br/>pure function"]
-    AS -->|"ALLOW: EdDSA token bound to fingerprint"| A
-    A -->|"signed POST /v1/transactions/execute"| GW["TransactionsService = payment gateway"]
-    GW -->|"verify, lock, re-check, consume once"| DB
-    GW --> PA["PaymentAdapter (sandbox)<br/>holds provider credentials"]
+    AS -->|"ALLOW: token binding the complete instruction"| A
+    A -->|"POST /v1/transactions/execute"| GW["Gateway = TransactionsService"]
+    GW -->|"verify, lock, rebuild instruction from current records, consume once"| DB
+    GW --> PA["PaymentAdapter<br/>idempotency key + status lookup"]
+    RC["Reconciler<br/>(background + on retry)"] --> PA
+    RC --> DB
+    AS --> SM["SecurityMonitor<br/>graded responses"]
+    GW --> SM
+    G --> SM
     AS --> AU["AuditService<br/>hash chain + signature"]
     GW --> AU
-    AU --> DB
-    AS --> CB["CircuitBreaker"]
-    GW --> CB
 ```
 
 | Component | Responsibility | Location |
 |---|---|---|
-| `AuthGuard` | Authenticates humans (bearer token) and agents (signed requests, replay-protected). Rejects routes without an access rule. | `apps/api/src/auth/` |
-| `FactsLoader` | Loads every policy input from the database inside a transaction, taking row locks in a fixed order. | `apps/api/src/authorizations/facts.loader.ts` |
+| `AuthGuard` | Humans via bearer token; agents via signed requests. Workload credentials may only mint sessions; only session keys may authorize/pay. Replay-protected. Fail-closed. | `apps/api/src/auth/` |
+| `SessionsController` | Mints short-lived session credentials; lists security alerts | `apps/api/src/auth/sessions.controller.ts` |
+| `SuppliersController` | Versioned supplier records; step-up auth; dual-control verification with evidence; invalidation on change | `apps/api/src/suppliers/` |
+| `FactsLoader` | Loads policy inputs from the DB inside a transaction with ordered row locks | `apps/api/src/authorizations/facts.loader.ts` |
 | `policy-engine` | Pure, deterministic evaluation → decision + reason codes. No I/O, no AI. | `packages/policy-engine` |
-| `AuthorizationsService` | Persists decisions, budget holds and audit evidence atomically; issues tokens; handles approvals. | `apps/api/src/authorizations/` |
-| Gateway (`TransactionsService`) | The single enforcement point for payment. | `apps/api/src/transactions/` |
-| `PaymentAdapter` | Boundary to money movement; sandbox now, Stripe / Modern Treasury / banks later. | `apps/api/src/transactions/payment-adapter.ts` |
-| `AuditService` | Signed, hash-chained, append-only evidence per organization. | `apps/api/src/audit/` |
-| `CircuitBreakerService` | Suspends agents after N denials/rejections in a window. | `apps/api/src/authorizations/circuit-breaker.service.ts` |
+| `AuthorizationsService` | Persists decisions, holds and evidence atomically; issues complete-binding tokens; approvals re-evaluate | `apps/api/src/authorizations/` |
+| `invalidateLiveAuthorizations` | Kills live authorizations when supplier/policy/delegation/agent change | `apps/api/src/authorizations/invalidation.ts` |
+| Gateway (`TransactionsService`) | Single enforcement point; payment state machine; reconciliation | `apps/api/src/transactions/` |
+| `PaymentAdapter` | Provider boundary (sandbox with persisted ledger + fault injection) | `apps/api/src/transactions/payment-adapter.ts` |
+| `ReconcilerService` | Background resolution of `executing`/`unknown` transactions | `apps/api/src/transactions/reconciler.service.ts` |
+| `SecurityMonitorService` | Graded responses: suspend only on authenticated violations; alert otherwise | `apps/api/src/security/` |
+| `AuditService` | Signed, hash-chained, append-only evidence per organization | `apps/api/src/audit/` |
 
-## Request lifecycle
+## Agent identity
 
 ```mermaid
 sequenceDiagram
-    participant Agent
-    participant API as AgentTrust API
-    participant DB as PostgreSQL
-    participant GW as Gateway
-    participant PSP as Payment provider
-
-    Agent->>API: POST /v1/authorizations (Ed25519-signed)
-    API->>API: verify signature, timestamp, nonce
-    API->>DB: BEGIN; lock Agent, PO, Invoice; load facts
-    API->>API: evaluatePurchase(facts) → ALLOW
-    API->>DB: insert Authorization + BudgetReservation + AuditEvent; COMMIT
-    API-->>Agent: decision + reason codes + signed token (10 min, single use)
-    Agent->>GW: POST /v1/transactions/execute (token + expected params, signed)
-    GW->>GW: verify token signature, caller, exact params
-    GW->>DB: BEGIN; lock Authorization; re-check agent, delegation, supplier bank, invoice
-    GW->>DB: consume authorization, hold, invoice; insert Transaction(pending) + audit; COMMIT
-    GW->>PSP: pay verified counterparty (idempotency key = authorization id)
-    GW->>DB: Transaction succeeded/failed + audit
-    GW-->>Agent: transaction result
+    participant S as Signer (sidecar/KMS)
+    participant R as Agent runtime (SDK)
+    participant API as AgentTrust
+    R->>R: generate ephemeral Ed25519 key (in-memory, non-exported)
+    R->>S: sign("create session" request)
+    S-->>R: signature (workload key never leaves the signer)
+    R->>API: POST /v1/agent-sessions (workload-signed)
+    API-->>R: sessionId, expiresAt (≤ 15 min default)
+    R->>API: POST /v1/authorizations (session-signed: method, path, ts, nonce, body hash)
 ```
+
+Cryptography proves *which credential* signed a request and that the payload wasn't altered. It does **not** prove
+human intent. Intent comes from human-only records (delegations, POs, invoices, approvals) that the agent
+can reference but never create or modify.
+
+## Payment lifecycle and state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> allowed: policy ALLOW (token issued)
+    allowed --> invalidated: supplier / policy / delegation / agent changed
+    allowed --> expired: TTL elapsed
+    allowed --> consumed: gateway consumes (single use)
+    consumed --> executing: Transaction created, invoice → processing
+    executing --> succeeded: provider confirms
+    executing --> failed: provider declines (hold released, invoice reopened)
+    executing --> unknown: timeout / error / crash
+    unknown --> succeeded: reconcile: provider has it
+    unknown --> failed: reconcile: provider declined
+    unknown --> executing: reconcile: provider has no record → resend SAME idempotency key
+    unknown --> reconciliation_required: still unknown after 3 attempts (alert, human)
+    succeeded --> [*]
+    failed --> [*]
+```
+
+Rules:
+- The attempt counter is persisted **before** each provider call; every call is logged (`TransactionAttempt`).
+- Every provider call for a transaction uses the **same idempotency key** (the authorization id).
+- Before any resend, the gateway **queries the provider** for the previous attempt.
+- Outcomes apply **exactly once** (conditional updates); a lease prevents concurrent reconcilers.
+- Retrying `execute` with a consumed authorization reconciles if non-final, otherwise returns `AUTHORIZATION_ALREADY_USED`.
+
+## Complete payment binding
+
+`authorizationFingerprint` (v2) = SHA-256 over canonical JSON of:
+`organizationId, agentId, action, supplierId, supplierVersion, paymentRail, destinationRef,
+paymentDestinationFingerprint, amountCents, currency, purchaseOrderId, invoiceId, policyId, policyVersion, delegationId`.
+
+The token signs all of these. At execution the gateway **rebuilds the instruction from current records** and
+rejects with a specific reason if anything differs.
 
 ## Key design decisions
 
-1. **Identity comes only from credentials.** Organization and agent are derived from the verified request
-   signature; strict schemas reject unknown body fields, so `organizationId` cannot be smuggled in.
-2. **The agent references, the server resolves.** Requests carry IDs (supplier, PO, invoice) and the payee
-   details the agent *intends* to pay. The server compares those against trusted records.
-3. **Transaction fingerprint.** SHA-256 over canonical JSON of org, agent, supplier, payee fingerprint,
-   amount, currency, PO and invoice. The authorization token signs this fingerprint and every field.
-4. **Two independent payee checks.** The engine denies mismatched payees at authorization time; the gateway
-   re-checks the supplier's *current* bank fingerprint at execution time and pays the supplier's verified
-   counterparty, never an agent-supplied destination.
-5. **Concurrency via PostgreSQL row locks.** Global lock order: `Authorization → Agent → PurchaseOrder →
-   Invoice → AuditChainHead`. The Agent lock serializes one agent's spending decisions; PO and invoice locks
-   protect shared capacity. A partial unique index guarantees one live hold per invoice.
-6. **Two-phase execution.** Consumption commits before the provider call; the provider is called with the
-   authorization id as idempotency key; a crash leaves a `pending` transaction for reconciliation and can
-   never double-pay.
-7. **Policies are immutable versions.** Every decision records the policy version that made it.
-8. **Fail closed.** Missing policy, invalid stored rules, unknown keys, DB errors and exceptions all produce
-   "not authorized".
+1. Identity comes only from credentials. Strict schemas reject unknown fields.
+2. The agent references; the server resolves. Agent-supplied payee details are compared, never trusted. The gateway
+   pays the supplier's verified provider counterparty, never an agent-supplied destination.
+3. **Lock order:** `Authorization → Agent → PurchaseOrder → Invoice → AuditChainHead`. Supplier changes lock
+   `Supplier → Authorization(s) → AuditChainHead`. No transaction locks Authorization then Supplier.
+4. Policies, delegations and supplier records are versioned/immutable grants. Authorizations bind exact versions.
+5. Fail closed everywhere. Monitoring failures never change an authorization outcome.
 
-See [ADRs](adr/) for the reasoning behind the stack and security choices.
+See [ADR-0003](adr/0003-hardening.md) for the hardening decisions.

@@ -115,6 +115,10 @@ describe('policy engine', () => {
     const inFlight = baseline();
     inFlight.invoiceInFlight = true;
     expect(evaluatePurchase(inFlight).reasonCodes).toContain('INVOICE_IN_FLIGHT');
+
+    const processing = baseline();
+    processing.invoice!.status = 'processing';
+    expect(evaluatePurchase(processing).reasonCodes).toContain('INVOICE_IN_FLIGHT');
   });
 
   it('DENYs when the budget would be exceeded', () => {

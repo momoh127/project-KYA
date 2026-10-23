@@ -1,15 +1,24 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma, type Authorization } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
-import { signAuthorizationToken, type AuthorizationClaims } from '@agenttrust/authorization';
+import { claimsFromBinding, signAuthorizationToken } from '@agenttrust/authorization';
 import { evaluatePurchase, type PolicyResult } from '@agenttrust/policy-engine';
-import { IdPrefix, newId, transactionFingerprint, type PaymentDestination, type TransactionIntent } from '@agenttrust/shared';
+import {
+  authorizationFingerprint,
+  IdPrefix,
+  newId,
+  transactionFingerprint,
+  type AuthorizationBinding,
+  type PaymentDestination,
+  type TransactionIntent,
+} from '@agenttrust/shared';
 import type { AgentPrincipal, HumanPrincipal } from '../auth/principal';
 import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../common/crypto.service';
 import { Errors } from '../common/errors';
 import { cents, PrismaService, type Tx } from '../common/prisma.service';
-import { CircuitBreakerService } from './circuit-breaker.service';
+import { SecurityMonitorService } from '../security/security-monitor.service';
+import { buildBinding } from './binding';
 import { FactsLoader, type LoadedFacts } from './facts.loader';
 
 export interface CreateAuthorizationBody {
@@ -36,7 +45,7 @@ export class AuthorizationsService {
     private readonly crypto: CryptoService,
     private readonly audit: AuditService,
     private readonly facts: FactsLoader,
-    private readonly breaker: CircuitBreakerService,
+    private readonly security: SecurityMonitorService,
   ) {}
 
   /**
@@ -85,7 +94,7 @@ export class AuthorizationsService {
       throw e;
     }
 
-    if (row.decision === 'DENY') await this.breaker.check(agent.organizationId, agent.agentId);
+    if (row.decision === 'DENY') await this.security.recordDenial(agent.organizationId, agent.agentId, row.id, row.reasonCodes);
     return toView(row, { includeToken: true });
   }
 
@@ -106,8 +115,11 @@ export class AuthorizationsService {
 
     let token: string | null = null;
     let tokenNonce: string | null = null;
+    let binding: AuthorizationBinding | null = null;
     if (result.decision === 'ALLOW') {
-      ({ token, tokenNonce } = this.issueToken(id, intent, fingerprint, loaded, now, expiresAt));
+      binding = buildBinding(intent, loaded.supplier, loaded.policy, loaded.delegation);
+      if (!binding) throw new Error('invariant: ALLOW without a complete payment binding');
+      ({ token, tokenNonce } = this.issueToken(id, binding, agent.sessionId, now, expiresAt));
     }
 
     const row = await tx.authorization.create({
@@ -116,13 +128,18 @@ export class AuthorizationsService {
         organizationId: intent.organizationId,
         agentId: intent.agentId,
         credentialId: agent.credentialId,
+        sessionId: agent.sessionId,
         delegationId: loaded.delegation?.id ?? null,
         policyId: loaded.policy?.id ?? null,
         policyVersion: loaded.policy?.version ?? null,
         idempotencyKey,
         transactionFingerprint: fingerprint,
+        authorizationFingerprint: binding ? authorizationFingerprint(binding) : null,
         action: intent.action,
         supplierId: intent.supplierId,
+        supplierVersion: loaded.supplier?.version ?? null,
+        paymentRail: binding?.paymentRail ?? null,
+        destinationRef: binding?.destinationRef ?? null,
         paymentDestinationFingerprint: intent.paymentDestinationFingerprint,
         amountCents: BigInt(intent.amountCents),
         currency: intent.currency,
@@ -166,33 +183,20 @@ export class AuthorizationsService {
       actorId: intent.agentId,
       eventType: { ALLOW: 'authorization.allowed', REVIEW: 'authorization.review', DENY: 'authorization.denied' }[result.decision],
       subjectId: id,
-      payload: decisionPayload(intent, fingerprint, result, loaded.delegation?.id ?? null, expiresAt),
+      payload: decisionPayload(intent, fingerprint, result, loaded.delegation?.id ?? null, expiresAt, binding),
     });
     return row;
   }
 
-  private issueToken(id: string, intent: TransactionIntent, fingerprint: string, loaded: LoadedFacts, now: Date, expiresAt: Date) {
-    if (!loaded.delegation || !loaded.policy) throw new Error('invariant: ALLOW without delegation/policy');
+  private issueToken(id: string, binding: AuthorizationBinding, sessionId: string | null, now: Date, expiresAt: Date) {
     const tokenNonce = randomBytes(16).toString('hex');
-    const claims: AuthorizationClaims = {
-      iss: 'agenttrust',
-      jti: id,
-      org: intent.organizationId,
-      agt: intent.agentId,
-      dlg: loaded.delegation.id,
-      pol: loaded.policy.id,
-      pv: loaded.policy.version,
-      fp: fingerprint,
-      sup: intent.supplierId,
-      pd: intent.paymentDestinationFingerprint,
-      amt: intent.amountCents,
-      cur: intent.currency,
-      po: intent.purchaseOrderId,
-      inv: intent.invoiceId,
+    const claims = claimsFromBinding(binding, {
+      id,
+      sessionId,
       iat: Math.floor(now.getTime() / 1000),
       exp: Math.floor(expiresAt.getTime() / 1000),
       nonce: tokenNonce,
-    };
+    });
     return { token: signAuthorizationToken(claims, this.crypto.signer), tokenNonce };
   }
 
@@ -262,14 +266,19 @@ export class AuthorizationsService {
       }
 
       const expiresAt = new Date(now.getTime() + loaded.rules!.authorizationTtlSeconds * 1000);
-      const { token, tokenNonce } = this.issueToken(auth.id, intent, auth.transactionFingerprint, loaded, now, expiresAt);
+      // Bind to the CURRENT supplier version, policy version and delegation.
+      const binding = buildBinding(intent, loaded.supplier, loaded.policy, loaded.delegation);
+      if (!binding) throw new Error('invariant: ALLOW without a complete payment binding');
+      const { token, tokenNonce } = this.issueToken(auth.id, binding, auth.sessionId, now, expiresAt);
       const updated = await tx.authorization.update({
         where: { id: auth.id },
         data: {
           decision: 'ALLOW', status: 'allowed', reasonCodes: result.reasonCodes,
           checks: result.checks as unknown as Prisma.InputJsonArray, approvable: false,
           token, tokenNonce, expiresAt,
-          delegationId: loaded.delegation!.id, policyId: loaded.policy!.id, policyVersion: loaded.policy!.version,
+          authorizationFingerprint: authorizationFingerprint(binding),
+          supplierVersion: binding.supplierVersion, paymentRail: binding.paymentRail, destinationRef: binding.destinationRef,
+          delegationId: binding.delegationId, policyId: binding.policyId, policyVersion: binding.policyVersion,
         },
       });
       await tx.budgetReservation.upsert({
@@ -354,7 +363,14 @@ export function intentFromRow(a: Authorization): TransactionIntent {
   };
 }
 
-function decisionPayload(intent: TransactionIntent, fingerprint: string, result: PolicyResult, delegationId: string | null, expiresAt: Date) {
+function decisionPayload(
+  intent: TransactionIntent,
+  fingerprint: string,
+  result: PolicyResult,
+  delegationId: string | null,
+  expiresAt: Date,
+  binding: AuthorizationBinding | null,
+) {
   return {
     decision: result.decision,
     reasonCodes: result.reasonCodes,
@@ -365,6 +381,10 @@ function decisionPayload(intent: TransactionIntent, fingerprint: string, result:
     invoiceId: intent.invoiceId,
     paymentDestinationFingerprint: intent.paymentDestinationFingerprint,
     transactionFingerprint: fingerprint,
+    authorizationFingerprint: binding ? authorizationFingerprint(binding) : null,
+    supplierVersion: binding?.supplierVersion ?? null,
+    paymentRail: binding?.paymentRail ?? null,
+    destinationRef: binding?.destinationRef ?? null,
     policyId: result.policyId,
     policyVersion: result.policyVersion,
     delegationId,
@@ -386,6 +406,9 @@ export function toView(a: Authorization, opts: { includeToken: boolean }) {
     approvable: a.approvable,
     policyVersion: a.policyVersion,
     transactionFingerprint: a.transactionFingerprint,
+    authorizationFingerprint: a.authorizationFingerprint,
+    supplierVersion: a.supplierVersion,
+    paymentRail: a.paymentRail,
     amountCents: cents(a.amountCents),
     currency: a.currency,
     supplierId: a.supplierId,
@@ -393,6 +416,7 @@ export function toView(a: Authorization, opts: { includeToken: boolean }) {
     invoiceId: a.invoiceId,
     expiresAt: a.expiresAt.toISOString(),
     consumedAt: a.consumedAt?.toISOString() ?? null,
+    invalidatedReason: a.invalidatedReason,
     createdAt: a.createdAt.toISOString(),
     ...(opts.includeToken && status === 'allowed' && a.token ? { token: a.token } : {}),
   };

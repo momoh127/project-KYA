@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { IdPrefix, newId } from '@agenttrust/shared';
 import { CurrentUser, Human, type HumanPrincipal } from '../auth/principal';
 import { AuditService } from '../audit/audit.service';
+import { invalidateLiveAuthorizations } from '../authorizations/invalidation';
 import { Errors } from '../common/errors';
 import { cents, PrismaService } from '../common/prisma.service';
 import { zCents, zCurrency, ZodPipe, zId } from '../common/validation';
@@ -102,6 +103,14 @@ export class DelegationsController {
           supersededCount: superseded.count,
         },
       });
+      if (superseded.count > 0) {
+        await invalidateLiveAuthorizations(tx, this.audit, {
+          organizationId: user.organizationId,
+          where: { agentId: agent.id, delegationId: { not: id } },
+          reason: 'delegation superseded',
+          actor: { type: 'user', id: user.userId },
+        });
+      }
       return serializeDelegation(d);
     });
   }
@@ -129,6 +138,12 @@ export class DelegationsController {
         eventType: 'delegation.revoked',
         subjectId: id,
         payload: { agentId: d.agentId },
+      });
+      await invalidateLiveAuthorizations(tx, this.audit, {
+        organizationId: user.organizationId,
+        where: { delegationId: id },
+        reason: 'delegation revoked',
+        actor: { type: 'user', id: user.userId },
       });
       return serializeDelegation(updated);
     });

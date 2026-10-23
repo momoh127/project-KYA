@@ -7,9 +7,9 @@ import { AuditService } from './audit/audit.service';
 import { AuthGuard } from './auth/auth.guard';
 import { DevAuthController } from './auth/dev-auth.controller';
 import { DevTokenService, HUMAN_TOKEN_VERIFIER, RejectAllHumanTokens } from './auth/human-token';
+import { SessionsController } from './auth/sessions.controller';
 import { AuthorizationsController } from './authorizations/authorizations.controller';
 import { AuthorizationsService } from './authorizations/authorizations.service';
-import { CircuitBreakerService } from './authorizations/circuit-breaker.service';
 import { FactsLoader } from './authorizations/facts.loader';
 import { CryptoService } from './common/crypto.service';
 import { AllExceptionsFilter } from './common/exception.filter';
@@ -19,8 +19,11 @@ import { DelegationsController } from './delegations/delegations.controller';
 import { OrganizationsController } from './organizations/organizations.controller';
 import { PoliciesController } from './policies/policies.controller';
 import { ProcurementController } from './procurement/procurement.controller';
+import { SecurityMonitorService } from './security/security-monitor.service';
 import { SuppliersController } from './suppliers/suppliers.controller';
 import { PAYMENT_ADAPTER, SandboxPaymentAdapter } from './transactions/payment-adapter';
+import { ReconcilerService } from './transactions/reconciler.service';
+import { SandboxController } from './transactions/sandbox.controller';
 import { TransactionsController } from './transactions/transactions.controller';
 import { TransactionsService } from './transactions/transactions.service';
 
@@ -29,9 +32,10 @@ export class AppModule {
   static forConfig(config: AppConfig): DynamicModule {
     return {
       module: AppModule,
-      imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 1200 }])],
+      imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 2000 }])],
       controllers: [
         DevAuthController,
+        SessionsController,
         OrganizationsController,
         AgentsController,
         DelegationsController,
@@ -40,6 +44,7 @@ export class AppModule {
         ProcurementController,
         AuthorizationsController,
         TransactionsController,
+        SandboxController,
         AuditController,
       ],
       providers: [
@@ -54,10 +59,12 @@ export class AppModule {
           // Production: provide an OIDC/JWKS verifier here.
           useFactory: (dev: DevTokenService) => (dev.enabled ? dev : new RejectAllHumanTokens()),
         },
+        SecurityMonitorService,
         FactsLoader,
-        CircuitBreakerService,
         AuthorizationsService,
         TransactionsService,
+        ReconcilerService,
+        // Production: replace with a real provider adapter (Stripe, Modern Treasury, bank API).
         { provide: PAYMENT_ADAPTER, useClass: SandboxPaymentAdapter },
         { provide: APP_GUARD, useClass: ThrottlerGuard },
         { provide: APP_GUARD, useClass: AuthGuard },

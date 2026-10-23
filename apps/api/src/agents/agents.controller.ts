@@ -4,6 +4,7 @@ import { parseEd25519PublicKey } from '@agenttrust/identity';
 import { IdPrefix, newId } from '@agenttrust/shared';
 import { CurrentUser, Human, type HumanPrincipal } from '../auth/principal';
 import { AuditService } from '../audit/audit.service';
+import { invalidateLiveAuthorizations } from '../authorizations/invalidation';
 import { Errors } from '../common/errors';
 import { PrismaService } from '../common/prisma.service';
 import { ZodPipe, zId } from '../common/validation';
@@ -110,6 +111,15 @@ export class AgentsController {
         subjectId: id,
         payload: { previousStatus: agent.status, reason },
       });
+      if (status === 'revoked') {
+        await tx.agentSession.updateMany({ where: { agentId: id, revokedAt: null }, data: { revokedAt: new Date() } });
+        await invalidateLiveAuthorizations(tx, this.audit, {
+          organizationId: admin.organizationId,
+          where: { agentId: id },
+          reason: 'agent revoked',
+          actor: { type: 'user', id: admin.userId },
+        });
+      }
       return serializeAgent(updated);
     });
   }

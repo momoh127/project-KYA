@@ -33,7 +33,7 @@ export default defineConfig(() => {
     },
     test: {
       include: ['test/**/*.test.ts'],
-      env: { ...env, DATABASE_URL: env.TEST_DATABASE_URL ?? '' },
+      env: { ...env, DATABASE_URL: env.TEST_DATABASE_URL ?? '', AGENTTRUST_RECONCILE_INTERVAL_MS: '0' },
       testTimeout: 30_000,
       hookTimeout: 60_000,
       fileParallelism: false,

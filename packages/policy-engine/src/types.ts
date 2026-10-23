@@ -13,8 +13,26 @@ export interface PolicyRules {
   authorizationTtlSeconds: number;
   /** Lifetime of a REVIEW authorization awaiting a human decision. */
   reviewTtlSeconds: number;
-  /** Auto-suspend an agent after this many denials/rejections in the window. */
-  circuitBreaker: { denyThreshold: number; windowSeconds: number };
+  /**
+   * Graded responses to suspicious activity. Only AUTHENTICATED security
+   * violations (things only the agent's own key holder can do, such as
+   * presenting forged/tampered authorizations or another agent's token) can
+   * suspend an agent. Unauthenticated failures and business-policy denials
+   * raise alerts but never suspend, because outsiders could trigger them on
+   * purpose to knock a legitimate agent offline.
+   */
+  securityResponse: SecurityResponseRules;
+}
+
+export interface SecurityResponseRules {
+  /** Authenticated security violations within the window before auto-suspension. */
+  violationSuspendThreshold: number;
+  violationWindowSeconds: number;
+  /** Unauthenticated failures (bad signatures, replays) per credential before an alert + credential flag. */
+  authFailureAlertThreshold: number;
+  /** Business-policy denials (budget, amount, missing PO, ...) before an alert. */
+  denialAlertThreshold: number;
+  alertWindowSeconds: number;
 }
 
 export const DEFAULT_POLICY_RULES: PolicyRules = {
@@ -24,7 +42,13 @@ export const DEFAULT_POLICY_RULES: PolicyRules = {
   reviewThresholdCents: 250_000, // $2,500
   authorizationTtlSeconds: 600, // 10 minutes
   reviewTtlSeconds: 86_400, // 24 hours
-  circuitBreaker: { denyThreshold: 5, windowSeconds: 600 },
+  securityResponse: {
+    violationSuspendThreshold: 3,
+    violationWindowSeconds: 600,
+    authFailureAlertThreshold: 10,
+    denialAlertThreshold: 10,
+    alertWindowSeconds: 3600,
+  },
 };
 
 export interface PolicyFacts {
@@ -93,7 +117,8 @@ export interface InvoiceFacts {
   purchaseOrderId: string | null;
   amountCents: number;
   currency: string;
-  status: 'open' | 'paid' | 'void';
+  /** `processing` = a payment for it is executing or being reconciled. */
+  status: 'open' | 'processing' | 'paid' | 'void';
 }
 
 export interface PolicyResult {

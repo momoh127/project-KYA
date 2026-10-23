@@ -61,6 +61,8 @@ enum PoStatus {
 
 enum InvoiceStatus {
   open
+  /// A payment for this invoice is executing or its outcome is being reconciled.
+  processing
   paid
   void
 }
@@ -78,6 +80,8 @@ enum AuthorizationStatus {
   rejected
   consumed
   expired
+  /// Underlying record changed (supplier, delegation, policy) before execution.
+  invalidated
 }
 
 enum ApprovalDecision {
@@ -91,10 +95,14 @@ enum ReservationStatus {
   released
 }
 
+/// Payment state machine. A timeout is never treated as failure:
+/// executing -> succeeded | failed | unknown; unknown -> (reconcile) -> succeeded | failed | reconciliation_required
 enum TransactionStatus {
-  pending
+  executing
   succeeded
   failed
+  unknown
+  reconciliation_required
 }
 
 enum ActorType {
@@ -142,7 +150,11 @@ model Agent {
   @@index([organizationId])
 }
 
-/// Public keys only. Agent private keys never reach the server.
+/// Long-lived WORKLOAD credential (public key only). It can do exactly one
+/// thing: mint short-lived session credentials. It cannot request
+/// authorizations or execute payments. Production: replaced/augmented by a
+/// workload-identity attestation (SPIFFE JWT-SVID, cloud OIDC) and the private
+/// key lives in a sidecar/KMS outside the LLM-accessible environment.
 model AgentCredential {
   id             String           @id
   agentId        String
@@ -152,11 +164,29 @@ model AgentCredential {
   createdAt      DateTime         @default(now())
   expiresAt      DateTime?
   revokedAt      DateTime?
+  /// Set when repeated authentication failures suggest probing or compromise (alert, not suspension).
+  flaggedAt      DateTime?
+  flagReason     String?
 
   @@index([agentId])
 }
 
-/// Replay protection for signed agent requests.
+/// Short-lived session credential (default 15 min) minted by a workload credential.
+/// Only sessions may request authorizations and execute payments.
+model AgentSession {
+  id             String    @id
+  organizationId String
+  agentId        String
+  credentialId   String
+  publicKeyPem   String
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([agentId])
+}
+
+/// Replay protection for signed agent requests. `credentialId` holds the signing key id (akc_ or ags_).
 model AgentRequestNonce {
   credentialId String
   nonce        String
@@ -164,6 +194,20 @@ model AgentRequestNonce {
 
   @@id([credentialId, nonce])
   @@index([createdAt])
+}
+
+/// Low-confidence security signals (e.g. unauthenticated signature failures).
+/// Kept out of the audit chain so outsiders cannot flood evidence storage.
+model SecuritySignal {
+  id             String   @id
+  organizationId String
+  agentId        String
+  keyId          String
+  kind           String
+  reason         String
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId, agentId, kind, createdAt])
 }
 
 model Delegation {
@@ -218,11 +262,29 @@ model Supplier {
   paymentDestinationChangedAt       DateTime?
   verifiedByUserId                  String?
   verifiedAt                        DateTime?
+  /// How the payment destination was confirmed to belong to this supplier (e.g. callback to a known number).
+  verificationEvidence              String?
+  /// Incremented on every change; authorizations bind to the version they were issued against.
+  version                           Int                @default(1)
   status                            SupplierStatus     @default(active)
   createdAt                         DateTime           @default(now())
   updatedAt                         DateTime           @updatedAt
 
   @@index([organizationId])
+}
+
+/// Immutable history of supplier records (one row per version).
+model SupplierVersion {
+  id              String   @id
+  organizationId  String
+  supplierId      String
+  version         Int
+  changeType      String
+  changedByUserId String
+  snapshot        Json
+  createdAt       DateTime @default(now())
+
+  @@unique([supplierId, version])
 }
 
 model PurchaseOrder {
@@ -265,14 +327,24 @@ model Authorization {
   organizationId                String
   agentId                       String
   credentialId                  String
+  /// Session credential that signed the request.
+  sessionId                     String?
   delegationId                  String?
   policyId                      String?
   policyVersion                 Int?
   idempotencyKey                String
+  /// Hash of the agent's request (used for idempotency).
   transactionFingerprint        String
+  /// Hash of the COMPLETE payment instruction this authorization permits:
+  /// request fields + payment rail + provider destination + supplier-record
+  /// version + policy version + delegation. Signed into the token.
+  authorizationFingerprint      String?
   // Snapshot of the exact transaction intent (immutable once created).
   action                        String
   supplierId                    String?
+  supplierVersion               Int?
+  paymentRail                   String?
+  destinationRef                String?
   paymentDestinationFingerprint String
   amountCents                   BigInt
   currency                      String
@@ -289,12 +361,14 @@ model Authorization {
   tokenNonce                    String?
   expiresAt                     DateTime
   consumedAt                    DateTime?
+  invalidatedReason             String?
   createdAt                     DateTime            @default(now())
   updatedAt                     DateTime            @updatedAt
 
   @@unique([agentId, idempotencyKey])
   @@index([organizationId, createdAt])
   @@index([organizationId, status])
+  @@index([supplierId, status])
 }
 
 model Approval {
@@ -331,23 +405,67 @@ model BudgetReservation {
 }
 
 model Transaction {
-  id                String            @id
-  organizationId    String
+  id                     String            @id
+  organizationId         String
   /// Unique: an authorization can be executed at most once.
-  authorizationId   String            @unique
-  agentId           String
-  supplierId        String?
-  invoiceId         String?
-  amountCents       BigInt
-  currency          String
-  status            TransactionStatus
-  provider          String
-  providerReference String?
-  failureReason     String?
-  createdAt         DateTime          @default(now())
-  updatedAt         DateTime          @updatedAt
+  authorizationId        String            @unique
+  agentId                String
+  supplierId             String?
+  invoiceId              String?
+  amountCents            BigInt
+  currency               String
+  status                 TransactionStatus
+  provider               String
+  /// Sent with every provider call; the provider must deduplicate on it.
+  providerIdempotencyKey String            @unique
+  providerReference      String?
+  failureReason          String?
+  attempts               Int               @default(0)
+  lastAttemptAt          DateTime?
+  /// Short lease so only one worker reconciles a transaction at a time.
+  leaseUntil             DateTime?
+  finalizedAt            DateTime?
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @updatedAt
 
   @@index([organizationId, createdAt])
+  @@index([status, lastAttemptAt])
+}
+
+/// Every interaction with the payment provider, for investigation and reconciliation.
+model TransactionAttempt {
+  id                String   @id
+  organizationId    String
+  transactionId     String
+  attempt           Int
+  /// execute | status_query
+  action            String
+  /// succeeded | failed | unknown | not_found | pending | crashed
+  outcome           String
+  providerReference String?
+  detail            String?
+  createdAt         DateTime @default(now())
+
+  @@index([transactionId])
+}
+
+/// SANDBOX ONLY: simulates the external payment provider's own ledger, which
+/// survives gateway crashes (as a real provider's would).
+model SandboxProviderPayment {
+  idempotencyKey    String   @id
+  counterpartyRef   String
+  amountCents       BigInt
+  currency          String
+  status            String
+  providerReference String
+  createdAt         DateTime @default(now())
+}
+
+/// SANDBOX ONLY: queued fault injections (FIFO) for testing failure handling.
+model SandboxFault {
+  id        String   @id
+  fault     String
+  createdAt DateTime @default(now())
 }
 
 /// Append-only (enforced by a database trigger, see migration).

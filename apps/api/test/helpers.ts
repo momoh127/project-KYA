@@ -62,22 +62,23 @@ export async function createWorld(baseUrl: string, name = 'Acme Manufacturing') 
   const approver = await loginAs(approverUser.id);
   const member = await loginAs(memberUser.id);
 
-  const supplier = await admin.post<{ id: string }>('/v1/suppliers', {
-    name: 'Precision Tools Co',
-    paymentDestination: BANK_GOOD,
-    verificationStatus: 'verified',
-  });
+  const supplierId = await verifiedSupplier(admin, admin2, 'Precision Tools Co', BANK_GOOD);
 
   const world = {
     platform,
     orgId,
     adminUserId: created.admin.id,
+    admin2UserId: admin2User.id,
     approverUserId: approverUser.id,
     admin,
     admin2,
     approver,
     member,
-    supplierId: supplier.id,
+    supplierId,
+    loginAs,
+
+    /** Supplier onboarded by admin, verified by a second admin (dual control). */
+    verifiedSupplier: (name: string, bank: PaymentDestination) => verifiedSupplier(admin, admin2, name, bank),
 
     async createAgent(
       agentName: string,
@@ -107,15 +108,15 @@ export async function createWorld(baseUrl: string, name = 'Acme Manufacturing') 
     },
 
     /** An approved PO plus a matching open invoice. */
-    async poAndInvoice(amountCents: number, supplierId = supplier.id, invoiceAmountCents = amountCents) {
+    async poAndInvoice(amountCents: number, forSupplierId: string = supplierId, invoiceAmountCents = amountCents) {
       const po = await admin.post<{ id: string }>('/v1/purchase-orders', {
-        supplierId,
+        supplierId: forSupplierId,
         externalReference: `PO-${uniq()}`,
         approvedAmountCents: amountCents,
         currency: 'USD',
       });
       const invoice = await admin.post<{ id: string }>('/v1/invoices', {
-        supplierId,
+        supplierId: forSupplierId,
         purchaseOrderId: po.id,
         invoiceNumber: `INV-${uniq()}`,
         amountCents: invoiceAmountCents,
@@ -128,6 +129,19 @@ export async function createWorld(baseUrl: string, name = 'Acme Manufacturing') 
 }
 
 export type World = Awaited<ReturnType<typeof createWorld>>;
+
+export function last4(bank: PaymentDestination): string {
+  return bank.type === 'us_ach' ? bank.accountNumber.slice(-4) : bank.iban.slice(-4);
+}
+
+export async function verifiedSupplier(enteredBy: AgentTrustAdmin, verifiedBy: AgentTrustAdmin, name: string, bank: PaymentDestination): Promise<string> {
+  const s = await enteredBy.post<{ id: string }>('/v1/suppliers', { name, paymentDestination: bank });
+  await verifiedBy.post(`/v1/suppliers/${s.id}/verify-payment-destination`, {
+    evidence: 'Called supplier AP at the number on the signed master agreement; confirmed account.',
+    confirmedLast4: last4(bank),
+  });
+  return s.id;
+}
 
 export function purchase(
   agent: Agent,

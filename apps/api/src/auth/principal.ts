@@ -16,7 +16,11 @@ export interface AgentPrincipal {
   kind: 'agent';
   agentId: string;
   organizationId: string;
+  /** Long-lived workload credential (directly, or as the parent of the session). */
   credentialId: string;
+  /** Which key signed this request. Only `session` keys may authorize or pay. */
+  keyKind: 'workload' | 'session';
+  sessionId: string | null;
   /** Authenticated, but the agent may be suspended/revoked; endpoints decide. */
   agentStatus: 'active' | 'suspended' | 'revoked';
 }
@@ -28,6 +32,7 @@ export type AccessRule =
   | { type: 'bootstrap' }
   | { type: 'human'; roles: UserRole[] }
   | { type: 'agent' }
+  | { type: 'agent_workload' }
   | { type: 'human_or_agent' };
 
 export const ACCESS_KEY = 'agenttrust:access';
@@ -39,8 +44,10 @@ export const Public = () => SetMetadata(ACCESS_KEY, { type: 'public' } satisfies
 export const Bootstrap = () => SetMetadata(ACCESS_KEY, { type: 'bootstrap' } satisfies AccessRule);
 /** Authenticated human; if roles are given, the user must hold one of them. */
 export const Human = (...roles: UserRole[]) => SetMetadata(ACCESS_KEY, { type: 'human', roles } satisfies AccessRule);
-/** Authenticated agent (signed request). */
+/** Authenticated agent SESSION (short-lived key). Workload credentials are refused. */
 export const AgentOnly = () => SetMetadata(ACCESS_KEY, { type: 'agent' } satisfies AccessRule);
+/** Authenticated agent WORKLOAD credential: only used to mint sessions. */
+export const AgentWorkload = () => SetMetadata(ACCESS_KEY, { type: 'agent_workload' } satisfies AccessRule);
 export const HumanOrAgent = () => SetMetadata(ACCESS_KEY, { type: 'human_or_agent' } satisfies AccessRule);
 /** Requires the human to have authenticated within `maxAgeSeconds` (sensitive actions). */
 export const FreshAuth = (maxAgeSeconds = 900) => SetMetadata(FRESH_AUTH_KEY, maxAgeSeconds);

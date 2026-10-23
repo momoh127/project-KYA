@@ -1,34 +1,47 @@
 import { Body, Controller, Get, Param, Post, Put } from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
 import { z } from 'zod';
-import type { PolicyRules } from '@agenttrust/policy-engine';
+import { DEFAULT_POLICY_RULES, type PolicyRules } from '@agenttrust/policy-engine';
 import { IdPrefix, newId } from '@agenttrust/shared';
 import { CurrentUser, Human, type HumanPrincipal } from '../auth/principal';
 import { AuditService } from '../audit/audit.service';
+import { invalidateLiveAuthorizations } from '../authorizations/invalidation';
 import { Errors } from '../common/errors';
 import { PrismaService, type Tx } from '../common/prisma.service';
 import { ZodPipe } from '../common/validation';
 
-export const PolicyRulesSchema = z
+const SecurityResponseSchema = z
   .object({
-    missingPurchaseOrder: z.enum(['REVIEW', 'DENY']),
-    missingInvoice: z.enum(['ALLOW', 'REVIEW', 'DENY']),
-    unknownSupplier: z.enum(['REVIEW', 'DENY']),
-    reviewThresholdCents: z.number().int().positive().nullable(),
-    authorizationTtlSeconds: z.number().int().min(30).max(3600),
-    reviewTtlSeconds: z.number().int().min(300).max(7 * 86_400),
-    circuitBreaker: z
-      .object({ denyThreshold: z.number().int().min(1).max(1000), windowSeconds: z.number().int().min(60).max(86_400) })
-      .strict(),
+    violationSuspendThreshold: z.number().int().min(1).max(1000),
+    violationWindowSeconds: z.number().int().min(60).max(86_400),
+    authFailureAlertThreshold: z.number().int().min(1).max(100_000),
+    denialAlertThreshold: z.number().int().min(1).max(100_000),
+    alertWindowSeconds: z.number().int().min(60).max(7 * 86_400),
   })
   .strict();
+
+const rulesShape = {
+  missingPurchaseOrder: z.enum(['REVIEW', 'DENY']),
+  missingInvoice: z.enum(['ALLOW', 'REVIEW', 'DENY']),
+  unknownSupplier: z.enum(['REVIEW', 'DENY']),
+  reviewThresholdCents: z.number().int().positive().nullable(),
+  authorizationTtlSeconds: z.number().int().min(30).max(3600),
+  reviewTtlSeconds: z.number().int().min(1).max(7 * 86_400),
+  securityResponse: SecurityResponseSchema,
+};
+
+/** Rules accepted from administrators: strict (unknown keys rejected). */
+export const PolicyRulesSchema = z.object(rulesShape).strict();
+
+/** Rules read back from storage: tolerant of retired keys; older versions get default security responses. */
+const StoredRulesSchema = z.object({ ...rulesShape, securityResponse: SecurityResponseSchema.default(DEFAULT_POLICY_RULES.securityResponse) });
 
 const CreatePolicy = z.object({ name: z.string().min(1).max(200), rules: PolicyRulesSchema }).strict();
 const UpdatePolicy = z.object({ name: z.string().min(1).max(200).optional(), rules: PolicyRulesSchema }).strict();
 
 /** Parses stored rules; invalid stored rules fail closed (treated as no policy). */
 export function parseStoredRules(raw: unknown): PolicyRules | null {
-  const r = PolicyRulesSchema.safeParse(raw);
+  const r = StoredRulesSchema.safeParse(raw);
   return r.success ? r.data : null;
 }
 
@@ -82,6 +95,13 @@ export class PoliciesController {
       eventType: 'policy.version_created',
       subjectId: policy.id,
       payload: { version, name, rules: rules as unknown as Record<string, unknown> },
+    });
+    // Authorizations issued under the previous version are no longer valid.
+    await invalidateLiveAuthorizations(tx, this.audit, {
+      organizationId: admin.organizationId,
+      where: { policyId: { not: policy.id } },
+      reason: `policy changed to v${version}`,
+      actor: { type: 'user', id: admin.userId },
     });
     return policy;
   }

@@ -1,17 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { generateEd25519KeyPair, LocalEd25519Signer } from '@agenttrust/identity';
 import {
+  claimsFromBinding,
   signAuthorizationToken,
   tokenMismatches,
   verifyAuthorizationToken,
-  type AuthorizationClaims,
 } from '@agenttrust/authorization';
-import { base64UrlEncode, transactionFingerprint, type TransactionIntent } from '@agenttrust/shared';
+import { base64UrlEncode, type AuthorizationBinding } from '@agenttrust/shared';
 
 const NOW = new Date('2026-10-22T12:00:00Z');
 const nowSec = Math.floor(NOW.getTime() / 1000);
 
-const intent: TransactionIntent = {
+const binding: AuthorizationBinding = {
   organizationId: 'org_1',
   agentId: 'agt_104',
   action: 'purchase',
@@ -21,40 +21,28 @@ const intent: TransactionIntent = {
   currency: 'USD',
   purchaseOrderId: 'po_200',
   invoiceId: 'inv_900',
+  paymentRail: 'ach',
+  destinationRef: 'cp_100_v1',
+  supplierVersion: 1,
+  policyId: 'pol_1',
+  policyVersion: 3,
+  delegationId: 'dlg_1',
 };
 
 function setup() {
   const signer = new LocalEd25519Signer('key_1', generateEd25519KeyPair().privateKeyPem);
-  const claims: AuthorizationClaims = {
-    iss: 'agenttrust',
-    jti: 'auth_1',
-    org: intent.organizationId,
-    agt: intent.agentId,
-    dlg: 'dlg_1',
-    pol: 'pol_1',
-    pv: 3,
-    fp: transactionFingerprint(intent),
-    sup: intent.supplierId,
-    pd: intent.paymentDestinationFingerprint,
-    amt: intent.amountCents,
-    cur: intent.currency,
-    po: intent.purchaseOrderId,
-    inv: intent.invoiceId,
-    iat: nowSec,
-    exp: nowSec + 600,
-    nonce: 'n1',
-  };
+  const claims = claimsFromBinding(binding, { id: 'auth_1', sessionId: 'ags_1', iat: nowSec, exp: nowSec + 600, nonce: 'n1' });
   const token = signAuthorizationToken(claims, signer);
   const resolveKey = (kid: string) => (kid === signer.keyId ? signer.publicKey : null);
   return { signer, claims, token, resolveKey };
 }
 
 describe('authorization tokens', () => {
-  it('verifies and binds the exact transaction', () => {
+  it('verifies and binds the complete payment instruction', () => {
     const { token, resolveKey } = setup();
     const r = verifyAuthorizationToken(token, { resolveKey, now: NOW });
     expect(r.ok).toBe(true);
-    if (r.ok) expect(tokenMismatches(r.claims, intent)).toEqual([]);
+    if (r.ok) expect(tokenMismatches(r.claims, binding)).toEqual([]);
   });
 
   it('rejects a token whose amount was edited ($500 -> $5,000)', () => {
@@ -66,13 +54,25 @@ describe('authorization tokens', () => {
     expect(verifyAuthorizationToken(forged, { resolveKey, now: NOW })).toEqual({ ok: false, reason: 'BAD_SIGNATURE' });
   });
 
-  it('detects a valid token presented for a different transaction', () => {
+  it('detects any change in the underlying instruction or authority', () => {
     const { token, resolveKey } = setup();
     const r = verifyAuthorizationToken(token, { resolveKey, now: NOW });
     if (!r.ok) throw new Error('expected ok');
-    expect(tokenMismatches(r.claims, { ...intent, amountCents: 500_000 })).toEqual(['amountCents', 'fingerprint']);
-    expect(tokenMismatches(r.claims, { ...intent, paymentDestinationFingerprint: 'pd_attacker' }))
-      .toEqual(['paymentDestination', 'fingerprint']);
+    const cases: [Partial<AuthorizationBinding>, string][] = [
+      [{ amountCents: 500_000 }, 'amountCents'],
+      [{ paymentDestinationFingerprint: 'pd_attacker' }, 'paymentDestination'],
+      [{ supplierVersion: 2 }, 'supplierVersion'],
+      [{ paymentRail: 'wire' }, 'paymentRail'],
+      [{ destinationRef: 'cp_attacker' }, 'destinationRef'],
+      [{ policyVersion: 4 }, 'policyVersion'],
+      [{ delegationId: 'dlg_2' }, 'delegation'],
+      [{ currency: 'EUR' }, 'currency'],
+    ];
+    for (const [change, field] of cases) {
+      const m = tokenMismatches(r.claims, { ...binding, ...change });
+      expect(m).toContain(field);
+      expect(m).toContain('fingerprint');
+    }
   });
 
   it('rejects expired tokens, unknown keys, other signers and alg confusion', () => {

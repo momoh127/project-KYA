@@ -149,6 +149,7 @@ export function evaluatePurchase(facts: PolicyFacts): PolicyResult {
     const before = checks.length;
     if (inv.status === 'paid') deny(R.INVOICE_ALREADY_PAID, 'Invoice has already been paid.');
     else if (inv.status === 'void') deny(R.INVOICE_VOID, 'Invoice is void.');
+    else if (inv.status === 'processing') deny(R.INVOICE_IN_FLIGHT, 'A payment for this invoice is executing or being reconciled.');
     else if (facts.invoiceInFlight) deny(R.INVOICE_IN_FLIGHT, 'Invoice is already held by another live authorization.');
     if (inv.supplierId !== req.supplierId) deny(R.INVOICE_SUPPLIER_MISMATCH, 'Invoice is from a different supplier.');
     if (req.purchaseOrderId && inv.purchaseOrderId !== req.purchaseOrderId) {

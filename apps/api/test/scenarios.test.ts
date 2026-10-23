@@ -3,30 +3,39 @@
  * against a real API server and PostgreSQL database.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { PrismaClient } from '@prisma/client';
 import { base64UrlEncode } from '@agenttrust/shared';
 import { generateEd25519KeyPair, LocalEd25519Signer } from '@agenttrust/identity';
-import { signAuthorizationToken, type AuthorizationClaims } from '@agenttrust/authorization';
+import { claimsFromBinding, signAuthorizationToken } from '@agenttrust/authorization';
 import type { AuthorizationResponse } from '@agenttrust/sdk';
 import { apiError, BANK_ATTACKER, BANK_OTHER_SUPPLIER, createWorld, executeFor, purchase, startServer, type Agent, type TestServer, type World } from './helpers';
 
 let server: TestServer;
 let world: World;
 let agent: Agent; // Procurement Agent #104: $5,000 per purchase, $20,000 / month
+const prisma = new PrismaClient();
+
+async function raiseViolationThreshold(w: World) {
+  // This org's demo agent deliberately triggers many forged/tampered-token
+  // violations across scenarios, so raise its suspension threshold. Scenario
+  // 11 uses a separate organization with the default policy.
+  const { policies } = await w.admin.get<{ policies: { id: string; status: string; rules: Record<string, any> }[] }>('/v1/policies');
+  const active = policies.find((p) => p.status === 'active')!;
+  await w.admin.put(`/v1/policies/${active.id}`, {
+    rules: { ...active.rules, securityResponse: { ...active.rules.securityResponse, violationSuspendThreshold: 100 } },
+  });
+}
 
 beforeAll(async () => {
   server = await startServer();
   world = await createWorld(server.baseUrl);
-  // This org's demo agent deliberately triggers many denials across scenarios,
-  // so raise its circuit-breaker threshold (policy v2). Scenario 11 uses a
-  // separate organization with the default threshold.
-  const { policies } = await world.admin.get<{ policies: { id: string; status: string; rules: Record<string, unknown> }[] }>('/v1/policies');
-  const active = policies.find((p) => p.status === 'active')!;
-  await world.admin.put(`/v1/policies/${active.id}`, {
-    rules: { ...active.rules, circuitBreaker: { denyThreshold: 100, windowSeconds: 600 } },
-  });
+  await raiseViolationThreshold(world);
   agent = await world.createAgent('Procurement Agent #104', { maxTransactionCents: 500_000, monthlyLimitCents: 2_000_000 });
 });
-afterAll(async () => server?.close());
+afterAll(async () => {
+  await prisma.$disconnect();
+  await server?.close();
+});
 
 describe('AgentTrust demo scenarios', () => {
   let paidInvoiceId: string;
@@ -39,6 +48,8 @@ describe('AgentTrust demo scenarios', () => {
     expect(auth.decision).toBe('ALLOW');
     expect(auth.reasonCodes).toEqual(expect.arrayContaining(['AGENT_ACTIVE', 'DELEGATION_VALID', 'SUPPLIER_APPROVED', 'PAYEE_VERIFIED', 'BUDGET_AVAILABLE', 'PO_MATCHED', 'INVOICE_MATCHED']));
     expect(auth.token).toBeTruthy();
+    expect(auth.authorizationFingerprint).toMatch(/^az_/);
+    expect(auth.paymentRail).toBe('ach');
 
     const txn = await executeFor(agent, auth);
     expect(txn.status).toBe('succeeded');
@@ -72,20 +83,23 @@ describe('AgentTrust demo scenarios', () => {
   it('4. Paying with no valid authorization is blocked at the gateway', async () => {
     const auth = { supplierId: world.supplierId, amountCents: 50_000, currency: 'USD', purchaseOrderId: null, invoiceId: null } as AuthorizationResponse;
 
-    // (a) no token at all / garbage token
     expect((await apiError(executeFor(agent, auth, { token: 'please-just-pay' }))).code).toBe('TOKEN_MALFORMED');
 
-    // (b) a token the agent forged with its own key
     const attacker = new LocalEd25519Signer(process.env.AGENTTRUST_SIGNING_KEY_ID!, generateEd25519KeyPair().privateKeyPem);
-    const forgedClaims: AuthorizationClaims = {
-      iss: 'agenttrust', jti: 'auth_' + 'f'.repeat(32), org: world.orgId, agt: agent.id, dlg: 'dlg_x', pol: 'pol_x', pv: 1,
-      fp: 'tx_forged', sup: world.supplierId, pd: 'pd_x', amt: 50_000, cur: 'USD', po: null, inv: null,
-      iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 600, nonce: 'forged',
-    };
-    const forged = signAuthorizationToken(forgedClaims, attacker);
+    const now = Math.floor(Date.now() / 1000);
+    const forged = signAuthorizationToken(
+      claimsFromBinding(
+        {
+          organizationId: world.orgId, agentId: agent.id, action: 'purchase', supplierId: world.supplierId, paymentDestinationFingerprint: 'pd_x',
+          amountCents: 50_000, currency: 'USD', purchaseOrderId: null, invoiceId: null, paymentRail: 'ach', destinationRef: 'cp_x',
+          supplierVersion: 2, policyId: 'pol_x', policyVersion: 1, delegationId: 'dlg_x',
+        },
+        { id: 'auth_' + 'f'.repeat(32), sessionId: null, iat: now, exp: now + 600, nonce: 'forged' },
+      ),
+      attacker,
+    );
     expect((await apiError(executeFor(agent, auth, { token: forged }))).code).toBe('TOKEN_BAD_SIGNATURE');
 
-    // (c) an unsigned request straight to the gateway (no agent identity)
     const res = await fetch(`${server.baseUrl}/v1/transactions/execute`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ token: forged, expected: { supplierId: world.supplierId, amountCents: 50_000, currency: 'USD', purchaseOrderId: null, invoiceId: null } }),
@@ -111,18 +125,15 @@ describe('AgentTrust demo scenarios', () => {
     const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 50_000, poId, invoiceId });
     expect(auth.decision).toBe('ALLOW');
 
-    // (a) tamper with the signed token itself
     const [h, p, s] = auth.token!.split('.');
     const claims = JSON.parse(Buffer.from(p!, 'base64url').toString());
     claims.amt = 500_000;
     const tampered = `${h}.${base64UrlEncode(JSON.stringify(claims))}.${s}`;
     expect((await apiError(executeFor(agent, auth, { token: tampered, amountCents: 500_000 }))).code).toBe('TOKEN_BAD_SIGNATURE');
 
-    // (b) keep the valid token but ask the gateway to pay a different amount
     const mismatch = await apiError(executeFor(agent, auth, { amountCents: 500_000 }));
     expect(mismatch.code).toBe('TRANSACTION_MISMATCH');
 
-    // Nothing was paid; the original authorization still works for exactly $500.
     expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('open');
     expect((await executeFor(agent, auth)).status).toBe('succeeded');
   });
@@ -134,6 +145,7 @@ describe('AgentTrust demo scenarios', () => {
     const replay = await apiError(executeFor(agent, auth));
     expect(replay.status).toBe(409);
     expect(replay.code).toBe('AUTHORIZATION_ALREADY_USED');
+    expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(1);
   });
 
   it('9. REVIEW → human approves → payment executes', async () => {
@@ -143,10 +155,7 @@ describe('AgentTrust demo scenarios', () => {
     expect(auth.reasonCodes).toEqual(['APPROVAL_REQUIRED']);
     expect(auth.approvable).toBe(true);
 
-    // The agent cannot execute before approval...
     expect((await apiError(executeFor(agent, auth, { token: 'x' }))).code).toBe('TOKEN_MALFORMED');
-
-    // ...and cannot approve itself (approval routes are human-only).
     const selfApprove = await fetch(`${server.baseUrl}/v1/authorizations/${auth.id}/approve`, { method: 'POST' });
     expect(selfApprove.status).toBe(401);
 
@@ -167,34 +176,45 @@ describe('AgentTrust demo scenarios', () => {
     );
     const allowed = results.filter((r) => r.decision === 'ALLOW');
     const denied = results.filter((r) => r.decision === 'DENY');
-    expect(allowed).toHaveLength(2); // 2 × $500 fits in $1,200; a third would not
+    expect(allowed).toHaveLength(2);
     expect(denied).toHaveLength(3);
     for (const d of denied) expect(d.reasonCodes).toContain('BUDGET_EXCEEDED');
   });
 
-  it('11. A rogue agent that keeps getting denied is auto-suspended (circuit breaker)', async () => {
-    const other = await createWorld(server.baseUrl, 'Globex Corp'); // default policy: 5 strikes / 10 min
+  it('11. Graded response: scam-invoice denials alert but do NOT suspend; forged/tampered tokens DO', async () => {
+    const other = await createWorld(server.baseUrl, 'Globex Corp'); // default policy: 3 violations / 10 min
     const rogue = await other.createAgent('Compromised Agent #666', { maxTransactionCents: 500_000, monthlyLimitCents: 2_000_000 });
     const { poId, invoiceId } = await other.poAndInvoice(50_000);
     const legit = await purchase(rogue, { supplierId: other.supplierId, amountCents: 50_000, poId, invoiceId });
     expect(legit.decision).toBe('ALLOW');
 
-    for (let i = 0; i < 5; i++) {
-      const r = await purchase(rogue, { supplierId: other.supplierId, payee: BANK_ATTACKER, amountCents: 499_000 });
+    // (a) An outsider can make the agent read scam invoices: these are denied and
+    //     alerted on, but must not knock the agent offline.
+    for (let i = 0; i < 6; i++) {
+      const r = await purchase(rogue, { supplierId: other.supplierId, payee: BANK_ATTACKER, amountCents: 49_000 });
       expect(r.decision).toBe('DENY');
     }
-    const agentRecord = await other.admin.get<{ status: string; statusReason: string }>(`/v1/agents/${rogue.id}`);
-    expect(agentRecord.status).toBe('suspended');
-    expect(agentRecord.statusReason).toMatch(/circuit breaker/);
+    expect((await other.admin.get<{ status: string }>(`/v1/agents/${rogue.id}`)).status).toBe('active');
+    const { alerts } = await other.admin.get<{ alerts: { category?: string; type: string }[] }>('/v1/alerts');
+    expect(alerts.some((a) => a.category === 'fraud_signal')).toBe(true);
 
-    // Even its earlier, legitimate authorization can no longer be executed.
-    expect((await apiError(executeFor(rogue, legit))).code).toBe('AGENT_NOT_ACTIVE');
-    const after = await purchase(rogue, { supplierId: other.supplierId, amountCents: 50_000 });
-    expect(after.decision).toBe('DENY');
-    expect(after.reasonCodes).toContain('AGENT_NOT_ACTIVE');
+    // (b) Forging / tampering with authorizations requires the agent's own valid
+    //     session key: high-confidence compromise → suspended at the threshold.
+    const [h, p, s] = legit.token!.split('.');
+    const claims = JSON.parse(Buffer.from(p!, 'base64url').toString());
+    for (const amt of [60_000, 70_000, 80_000]) {
+      claims.amt = amt;
+      const tampered = `${h}.${base64UrlEncode(JSON.stringify(claims))}.${s}`;
+      expect((await apiError(executeFor(rogue, legit, { token: tampered, amountCents: amt }))).code).toBe('TOKEN_BAD_SIGNATURE');
+    }
+    const record = await other.admin.get<{ status: string; statusReason: string }>(`/v1/agents/${rogue.id}`);
+    expect(record.status).toBe('suspended');
+    expect(record.statusReason).toMatch(/security violations/);
 
-    // An administrator can reactivate after investigating.
-    const reactivated = await other.admin.post<{ status: string }>(`/v1/agents/${rogue.id}/reactivate`, { reason: 'investigated: prompt-injected invoice' });
+    // Its legitimate authorization is dead, and so are its sessions.
+    expect((await apiError(executeFor(rogue, legit))).status).toBe(401);
+
+    const reactivated = await other.admin.post<{ status: string }>(`/v1/agents/${rogue.id}/reactivate`, { reason: 'investigated' });
     expect(reactivated.status).toBe('active');
   });
 
@@ -206,32 +226,156 @@ describe('AgentTrust demo scenarios', () => {
 
     await world.admin.post(`/v1/agents/${doomed.id}/revoke`, { reason: 'decommissioned' });
 
-    expect((await apiError(executeFor(doomed, issued))).code).toBe('AGENT_NOT_ACTIVE');
-    const r = await purchase(doomed, { supplierId: world.supplierId, amountCents: 50_000, poId, invoiceId });
-    expect(r.decision).toBe('DENY');
-    expect(r.reasonCodes).toContain('AGENT_NOT_ACTIVE');
+    // Sessions are revoked with the agent, so it cannot even authenticate.
+    expect((await apiError(executeFor(doomed, issued))).status).toBe(401);
+    const auth = await world.admin.get<{ status: string; invalidatedReason: string }>(`/v1/authorizations/${issued.id}`);
+    expect(auth.status).toBe('invalidated');
+    // A fresh session cannot be minted either.
+    const fresh = await apiError(doomed.client.sessions.rotate());
+    expect(fresh.code).toBe('AGENT_NOT_ACTIVE');
   });
 
-  it('Bank details changed AFTER authorization → the gateway refuses to pay', async () => {
-    const supplier = await world.admin.post<{ id: string }>('/v1/suppliers', {
-      name: 'Midwest Bearings', paymentDestination: BANK_OTHER_SUPPLIER, verificationStatus: 'verified',
+  it('13. [required] Supplier bank details change after authorization → execution blocked', async () => {
+    const supplierId = await world.verifiedSupplier('Midwest Bearings', BANK_OTHER_SUPPLIER);
+    const { poId, invoiceId } = await world.poAndInvoice(50_000, supplierId);
+    const auth = await purchase(agent, { supplierId, payee: BANK_OTHER_SUPPLIER, amountCents: 50_000, poId, invoiceId });
+    expect(auth.decision).toBe('ALLOW');
+    expect(auth.supplierVersion).toBe(2);
+
+    await world.admin.patch(`/v1/suppliers/${supplierId}`, { paymentDestination: BANK_ATTACKER });
+
+    const refreshed = await world.admin.get<{ status: string; invalidatedReason: string }>(`/v1/authorizations/${auth.id}`);
+    expect(refreshed.status).toBe('invalidated');
+    expect(refreshed.invalidatedReason).toMatch(/supplier record changed/);
+    expect((await apiError(executeFor(agent, auth))).code).toBe('AUTHORIZATION_INVALIDATED');
+
+    // Even after a second admin verifies the new account, the old authorization stays dead.
+    await world.admin2.post(`/v1/suppliers/${supplierId}/verify-payment-destination`, {
+      evidence: 'Supplier confirmed new account by phone on the contract number.', confirmedLast4: '0011',
     });
-    const { poId, invoiceId } = await world.poAndInvoice(50_000, supplier.id);
-    const auth = await purchase(agent, { supplierId: supplier.id, payee: BANK_OTHER_SUPPLIER, amountCents: 50_000, poId, invoiceId });
+    expect((await apiError(executeFor(agent, auth))).code).toBe('AUTHORIZATION_INVALIDATED');
+    expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(0);
+  });
+
+  it('14. [required] Provider succeeds but the gateway crashes → no duplicate payment on retry', async () => {
+    const { poId, invoiceId } = await world.poAndInvoice(45_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 45_000, poId, invoiceId });
     expect(auth.decision).toBe('ALLOW');
 
-    await world.admin.patch(`/v1/suppliers/${supplier.id}`, { paymentDestination: BANK_ATTACKER });
-    expect((await apiError(executeFor(agent, auth))).code).toBe('SUPPLIER_NOT_VERIFIED');
+    await world.platform.sandboxFaults(['crash_after_processing']);
+    const crashed = await apiError(executeFor(agent, auth));
+    expect(crashed.status).toBe(500); // the process "died" after the provider accepted the payment
 
-    // Even after a second admin verifies the new account, the old authorization stays bound to the old account.
-    await world.admin2.patch(`/v1/suppliers/${supplier.id}`, { verificationStatus: 'verified' });
-    expect((await apiError(executeFor(agent, auth))).code).toBe('PAYEE_CHANGED');
+    const stuck = await prisma.transaction.findUniqueOrThrow({ where: { authorizationId: auth.id } });
+    expect(stuck.status).toBe('executing');
+    expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('processing');
+
+    // The agent retries with the same authorization: the gateway reconciles first.
+    const retried = await executeFor(agent, auth);
+    expect(retried.status).toBe('succeeded');
+    expect(retried.retried).toBe(true);
+    expect(retried.attempts).toBe(1); // no second execute call was sent
+
+    const ledger = await world.platform.sandboxLedger(auth.id);
+    expect(ledger.payments).toHaveLength(1); // exactly one payment at the provider
+    expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('paid');
+
+    const again = await apiError(executeFor(agent, auth));
+    expect(again.code).toBe('AUTHORIZATION_ALREADY_USED');
+    expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(1);
+  });
+
+  it('15. [required] Human approves after the delegation was revoked → transaction denied', async () => {
+    const a = await world.createAgent('Agent #108', { maxTransactionCents: 500_000, monthlyLimitCents: 2_000_000 });
+    const { poId, invoiceId } = await world.poAndInvoice(300_000);
+    const review = await purchase(a, { supplierId: world.supplierId, amountCents: 300_000, poId, invoiceId });
+    expect(review.decision).toBe('REVIEW');
+
+    const delegation = await prisma.delegation.findFirstOrThrow({ where: { agentId: a.id } });
+    await world.approver.post(`/v1/delegations/${delegation.id}/revoke`, {});
+
+    const err = await apiError(world.approver.post(`/v1/authorizations/${review.id}/approve`, {}));
+    expect(err.code).toBe('NOT_PENDING_REVIEW');
+    const after = await world.admin.get<{ status: string; invalidatedReason: string }>(`/v1/authorizations/${review.id}`);
+    expect(after.status).toBe('invalidated');
+    expect(after.invalidatedReason).toBe('delegation revoked');
+    expect((await a.client.authorizations.get(review.id)).token).toBeUndefined();
+  });
+
+  it('15b. Approval re-evaluates every rule: a delegation that EXPIRED during review → DENY', async () => {
+    const a = await world.createAgent('Agent #109', null);
+    await world.approver.post('/v1/delegations', {
+      agentId: a.id, actions: ['purchase'], currency: 'USD', maxTransactionCents: 500_000, monthlyLimitCents: 2_000_000,
+      expiresAt: new Date(Date.now() + 2_500).toISOString(),
+    });
+    const { poId, invoiceId } = await world.poAndInvoice(300_000);
+    const review = await purchase(a, { supplierId: world.supplierId, amountCents: 300_000, poId, invoiceId });
+    expect(review.decision).toBe('REVIEW');
+    await new Promise((r) => setTimeout(r, 3_000));
+
+    const result = await world.approver.post<{ status: string; decision: string; reasonCodes: string[] }>(`/v1/authorizations/${review.id}/approve`, {});
+    expect(result.decision).toBe('DENY');
+    expect(result.status).toBe('denied');
+    expect(result.reasonCodes).toContain('DELEGATION_EXPIRED');
+  });
+
+  it('16. Provider timeout after processing → outcome UNKNOWN (not failure) → reconciled, one payment', async () => {
+    const { poId, invoiceId } = await world.poAndInvoice(30_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 30_000, poId, invoiceId });
+    await world.platform.sandboxFaults(['timeout_after_processing']);
+    const first = await executeFor(agent, auth);
+    expect(first.status).toBe('unknown');
+
+    // A new authorization for the same invoice is refused while the outcome is unknown.
+    const dup = await purchase(agent, { supplierId: world.supplierId, amountCents: 30_000, poId, invoiceId });
+    expect(dup.decision).toBe('DENY');
+    expect(dup.reasonCodes).toContain('INVOICE_IN_FLIGHT');
+
+    const txn = await prisma.transaction.findUniqueOrThrow({ where: { authorizationId: auth.id } });
+    const reconciled = await world.admin.post<{ status: string; attempts: number }>(`/v1/transactions/${txn.id}/reconcile`, {});
+    expect(reconciled.status).toBe('succeeded');
+    expect(reconciled.attempts).toBe(1);
+    expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(1);
+  });
+
+  it('17. Provider timeout BEFORE processing → reconciliation finds nothing → safe resend with same key', async () => {
+    const { poId, invoiceId } = await world.poAndInvoice(31_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 31_000, poId, invoiceId });
+    await world.platform.sandboxFaults(['timeout_before_processing']);
+    expect((await executeFor(agent, auth)).status).toBe('unknown');
+    expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(0);
+
+    const retried = await executeFor(agent, auth);
+    expect(retried.status).toBe('succeeded');
+    expect(retried.attempts).toBe(2);
+    expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(1);
+
+    const txn = await world.admin.get<{ providerAttempts: { action: string; outcome: string }[] }>(`/v1/transactions/${retried.id}`);
+    expect(txn.providerAttempts.map((x) => `${x.action}:${x.outcome}`)).toEqual(['execute:unknown', 'status_query:not_found', 'execute:succeeded']);
+  });
+
+  it('18. Provider declines → FAILED; hold released and invoice reopened', async () => {
+    const { poId, invoiceId } = await world.poAndInvoice(32_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 32_000, poId, invoiceId });
+    await world.platform.sandboxFaults(['decline']);
+    expect((await executeFor(agent, auth)).status).toBe('failed');
+    expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('open');
+    const retry = await purchase(agent, { supplierId: world.supplierId, amountCents: 32_000, poId, invoiceId });
+    expect(retry.decision).toBe('ALLOW');
+  });
+
+  it('19. Policy changes after authorization → old authorization is invalid', async () => {
+    const { poId, invoiceId } = await world.poAndInvoice(33_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 33_000, poId, invoiceId });
+    expect(auth.decision).toBe('ALLOW');
+    await raiseViolationThreshold(world); // creates a new policy version
+    expect((await apiError(executeFor(agent, auth))).code).toBe('AUTHORIZATION_INVALIDATED');
   });
 
   it('The audit trail for everything above verifies end-to-end', async () => {
     const result = await world.admin.get<{ valid: boolean; eventsChecked: number; problems: unknown[] }>('/v1/audit/verify');
     expect(result.problems).toEqual([]);
     expect(result.valid).toBe(true);
-    expect(result.eventsChecked).toBeGreaterThan(40);
+    expect(result.eventsChecked).toBeGreaterThan(60);
   });
 });

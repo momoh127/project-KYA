@@ -55,7 +55,7 @@ export class OrganizationsController {
         },
       });
       await tx.policy.create({
-        data: { id: policyId, organizationId: orgId, name: 'Default purchasing policy', version: 1, rules: { ...DEFAULT_POLICY_RULES }, status: 'active' },
+        data: { id: policyId, organizationId: orgId, name: 'Default purchasing policy', version: 1, rules: JSON.parse(JSON.stringify(DEFAULT_POLICY_RULES)), status: 'active' },
       });
       await tx.auditChainHead.create({ data: { organizationId: orgId } });
       await this.audit.append(tx, {

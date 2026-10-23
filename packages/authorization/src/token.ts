@@ -1,11 +1,11 @@
 import type { KeyObject } from 'node:crypto';
 import {
+  authorizationFingerprint,
   base64UrlDecode,
   base64UrlEncode,
   canonicalJson,
   safeEqual,
-  transactionFingerprint,
-  type TransactionIntent,
+  type AuthorizationBinding,
 } from '@agenttrust/shared';
 import { ed25519Verify, type Signer } from '@agenttrust/identity';
 
@@ -13,9 +13,11 @@ import { ed25519Verify, type Signer } from '@agenttrust/identity';
  * Transaction-bound authorization tokens.
  *
  * Format: compact JWS (RFC 7515) with EdDSA / Ed25519 (RFC 8037).
- * The token binds every parameter of the approved transaction. It is a
- * statement of permission for ONE exact transaction; it is single-use
- * (enforced by the execution gateway in the database) and short-lived.
+ * The token binds the COMPLETE payment instruction (see AuthorizationBinding):
+ * organization, agent, supplier + supplier-record version, payment rail,
+ * provider destination, payee fingerprint, amount, currency, PO, invoice,
+ * policy version and delegation. It is single-use (enforced in the database
+ * by the gateway) and short-lived.
  */
 export const TOKEN_TYPE = 'agenttrust-authz+jws';
 
@@ -25,12 +27,17 @@ export interface AuthorizationClaims {
   jti: string;
   org: string;
   agt: string;
+  /** Session credential that requested it. */
+  sid: string | null;
   dlg: string;
   pol: string;
   pv: number;
-  /** Transaction fingerprint (hash over all transaction parameters). */
+  /** Authorization fingerprint over the complete payment instruction. */
   fp: string;
   sup: string | null;
+  sv: number;
+  rail: string;
+  dst: string;
   pd: string;
   amt: number;
   cur: string;
@@ -45,6 +52,35 @@ interface JwsHeader {
   alg: 'EdDSA';
   typ: typeof TOKEN_TYPE;
   kid: string;
+}
+
+export function claimsFromBinding(
+  b: AuthorizationBinding,
+  meta: { id: string; sessionId: string | null; iat: number; exp: number; nonce: string },
+): AuthorizationClaims {
+  return {
+    iss: 'agenttrust',
+    jti: meta.id,
+    org: b.organizationId,
+    agt: b.agentId,
+    sid: meta.sessionId,
+    dlg: b.delegationId,
+    pol: b.policyId,
+    pv: b.policyVersion,
+    fp: authorizationFingerprint(b),
+    sup: b.supplierId,
+    sv: b.supplierVersion,
+    rail: b.paymentRail,
+    dst: b.destinationRef,
+    pd: b.paymentDestinationFingerprint,
+    amt: b.amountCents,
+    cur: b.currency,
+    po: b.purchaseOrderId,
+    inv: b.invoiceId,
+    iat: meta.iat,
+    exp: meta.exp,
+    nonce: meta.nonce,
+  };
 }
 
 export function signAuthorizationToken(claims: AuthorizationClaims, signer: Signer): string {
@@ -109,21 +145,27 @@ export function verifyAuthorizationToken(token: string, opts: VerifyTokenOptions
 }
 
 /**
- * Checks that a verified token authorizes exactly this transaction intent.
- * Returns the list of mismatching fields (empty = exact match).
+ * Compares a verified token against the payment instruction derived from
+ * CURRENT trusted state. Returns the mismatching components (empty = exact
+ * match). Callers map components to specific rejection reasons.
  */
-export function tokenMismatches(claims: AuthorizationClaims, intent: TransactionIntent): string[] {
-  const mismatches: string[] = [];
-  if (claims.org !== intent.organizationId) mismatches.push('organizationId');
-  if (claims.agt !== intent.agentId) mismatches.push('agentId');
-  if (claims.sup !== intent.supplierId) mismatches.push('supplierId');
-  if (claims.pd !== intent.paymentDestinationFingerprint) mismatches.push('paymentDestination');
-  if (claims.amt !== intent.amountCents) mismatches.push('amountCents');
-  if (claims.cur !== intent.currency) mismatches.push('currency');
-  if (claims.po !== intent.purchaseOrderId) mismatches.push('purchaseOrderId');
-  if (claims.inv !== intent.invoiceId) mismatches.push('invoiceId');
-  if (!safeEqual(claims.fp, transactionFingerprint(intent))) mismatches.push('fingerprint');
-  return mismatches;
+export function tokenMismatches(claims: AuthorizationClaims, b: AuthorizationBinding): string[] {
+  const m: string[] = [];
+  if (claims.org !== b.organizationId) m.push('organizationId');
+  if (claims.agt !== b.agentId) m.push('agentId');
+  if (claims.sup !== b.supplierId) m.push('supplierId');
+  if (claims.sv !== b.supplierVersion) m.push('supplierVersion');
+  if (claims.rail !== b.paymentRail) m.push('paymentRail');
+  if (claims.dst !== b.destinationRef) m.push('destinationRef');
+  if (claims.pd !== b.paymentDestinationFingerprint) m.push('paymentDestination');
+  if (claims.amt !== b.amountCents) m.push('amountCents');
+  if (claims.cur !== b.currency) m.push('currency');
+  if (claims.po !== b.purchaseOrderId) m.push('purchaseOrderId');
+  if (claims.inv !== b.invoiceId) m.push('invoiceId');
+  if (claims.pol !== b.policyId || claims.pv !== b.policyVersion) m.push('policyVersion');
+  if (claims.dlg !== b.delegationId) m.push('delegation');
+  if (!safeEqual(claims.fp, authorizationFingerprint(b))) m.push('fingerprint');
+  return m;
 }
 
 function isClaims(c: unknown): c is AuthorizationClaims {
@@ -134,8 +176,8 @@ function isClaims(c: unknown): c is AuthorizationClaims {
   const int = (k: string) => Number.isSafeInteger(o[k]);
   return (
     o.iss === 'agenttrust' &&
-    str('jti') && str('org') && str('agt') && str('dlg') && str('pol') && int('pv') &&
-    str('fp') && strOrNull('sup') && str('pd') && int('amt') && str('cur') &&
-    strOrNull('po') && strOrNull('inv') && int('iat') && int('exp') && str('nonce')
+    str('jti') && str('org') && str('agt') && strOrNull('sid') && str('dlg') && str('pol') && int('pv') &&
+    str('fp') && strOrNull('sup') && int('sv') && str('rail') && str('dst') && str('pd') && int('amt') &&
+    str('cur') && strOrNull('po') && strOrNull('inv') && int('iat') && int('exp') && str('nonce')
   );
 }
