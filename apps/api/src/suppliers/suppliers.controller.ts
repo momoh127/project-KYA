@@ -162,6 +162,12 @@ export class SuppliersController {
 
       const updated = await tx.supplier.update({ where: { id }, data });
       await this.snapshot(tx, updated, changeType, admin.userId);
+      await invalidateLiveAuthorizations(tx, this.audit, {
+        organizationId: admin.organizationId,
+        where: { supplierId: id },
+        reason: `supplier record changed (v${version}: ${changeType})`,
+        actor: { type: 'user', id: admin.userId },
+      });
       await this.audit.append(tx, {
         organizationId: admin.organizationId,
         actorType: 'user',
@@ -169,12 +175,6 @@ export class SuppliersController {
         eventType: changeType === 'payment_destination_changed' ? 'supplier.payment_destination_changed' : 'supplier.updated',
         subjectId: id,
         payload: { version, ...changes },
-      });
-      await invalidateLiveAuthorizations(tx, this.audit, {
-        organizationId: admin.organizationId,
-        where: { supplierId: id },
-        reason: `supplier record changed (v${version}: ${changeType})`,
-        actor: { type: 'user', id: admin.userId },
       });
       return serializeSupplier(updated);
     });
@@ -201,6 +201,12 @@ export class SuppliersController {
         data: { verificationStatus: 'verified', verifiedByUserId: admin.userId, verifiedAt: new Date(), verificationEvidence: body.evidence, version },
       });
       await this.snapshot(tx, updated, 'payment_destination_verified', admin.userId);
+      await invalidateLiveAuthorizations(tx, this.audit, {
+        organizationId: admin.organizationId,
+        where: { supplierId: id },
+        reason: `supplier record changed (v${version}: payment_destination_verified)`,
+        actor: { type: 'user', id: admin.userId },
+      });
       await this.audit.append(tx, {
         organizationId: admin.organizationId,
         actorType: 'user',
@@ -208,12 +214,6 @@ export class SuppliersController {
         eventType: 'supplier.payment_destination_verified',
         subjectId: id,
         payload: { version, paymentDestinationLast4: s.paymentDestinationLast4, enteredByUserId: s.paymentDestinationChangedByUserId, evidence: body.evidence },
-      });
-      await invalidateLiveAuthorizations(tx, this.audit, {
-        organizationId: admin.organizationId,
-        where: { supplierId: id },
-        reason: `supplier record changed (v${version}: payment_destination_verified)`,
-        actor: { type: 'user', id: admin.userId },
       });
       return serializeSupplier(updated);
     });

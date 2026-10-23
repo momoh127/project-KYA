@@ -11,6 +11,7 @@ import {
   type AuthorizationResponse,
   type PaymentDestination,
 } from '@agenttrust/sdk';
+import { signRequest } from '@agenttrust/identity';
 import { createApp } from '../src/app';
 import { loadConfig } from '../src/config';
 
@@ -107,28 +108,53 @@ export async function createWorld(baseUrl: string, name = 'Acme Manufacturing') 
       };
     },
 
-    /** An approved PO plus a matching open invoice. */
-    async poAndInvoice(amountCents: number, forSupplierId: string = supplierId, invoiceAmountCents = amountCents) {
+    /**
+     * The trusted business setup for one purchase: an approved PO, a purchase
+     * instruction assigned to `agent` (requested by an admin, independently
+     * approved by the approver), and a matching invoice with trusted lines.
+     */
+    async order(agent: Agent | string, amountCents: number, o: OrderOptions = {}) {
+      const agentId = typeof agent === 'string' ? agent : agent.id;
+      const forSupplier = o.supplierId ?? supplierId;
+      const sku = `SKU-${uniq()}`;
+      const lines = o.lines ?? [{ lineNumber: 1, sku, description: 'Tooling item', quantity: '1', unitPriceCents: amountCents }];
       const po = await admin.post<{ id: string }>('/v1/purchase-orders', {
-        supplierId: forSupplierId,
-        externalReference: `PO-${uniq()}`,
-        approvedAmountCents: amountCents,
-        currency: 'USD',
+        supplierId: forSupplier, externalReference: `PO-${uniq()}`, approvedAmountCents: o.poAmountCents ?? amountCents * (o.maxUses ?? 1), currency: 'USD',
       });
-      const invoice = await admin.post<{ id: string }>('/v1/invoices', {
-        supplierId: forSupplierId,
-        purchaseOrderId: po.id,
-        invoiceNumber: `INV-${uniq()}`,
-        amountCents: invoiceAmountCents,
-        currency: 'USD',
+      const instruction = await admin.post<{ id: string; version: number }>('/v1/purchase-instructions', {
+        agentId, supplierId: forSupplier, purchaseOrderId: po.id, fulfillmentType: o.fulfillmentType ?? 'physical_goods', currency: 'USD',
+        lines, maxUses: o.maxUses ?? 1, expiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
       });
-      return { poId: po.id, invoiceId: invoice.id };
+      if (o.approve !== false) await (o.approver ?? approver).post(`/v1/purchase-instructions/${instruction.id}/approve`, {});
+      let invoiceId: string | undefined;
+      if (o.invoice !== false) {
+        const invLines = o.invoiceLines ?? lines.map((l) => ({ lineNumber: l.lineNumber, instructionLineNumber: l.lineNumber, sku: l.sku, description: l.description, quantity: l.quantity, unitPriceCents: l.unitPriceCents }));
+        const inv = await admin.post<{ id: string }>('/v1/invoices', {
+          supplierId: forSupplier, purchaseOrderId: po.id, purchaseInstructionId: instruction.id, invoiceNumber: `INV-${uniq()}`,
+          amountCents: o.invoiceAmountCents ?? amountCents, currency: 'USD', lines: invLines,
+        });
+        invoiceId = inv.id;
+      }
+      return { supplierId: forSupplier, poId: po.id, invoiceId, instructionId: instruction.id, sku };
     },
   };
   return world;
 }
 
 export type World = Awaited<ReturnType<typeof createWorld>>;
+
+export interface OrderOptions {
+  supplierId?: string;
+  fulfillmentType?: 'physical_goods' | 'services' | 'subscription' | 'digital_goods';
+  maxUses?: number;
+  poAmountCents?: number;
+  lines?: { lineNumber: number; sku?: string; description: string; quantity: string; unitPriceCents: number }[];
+  invoice?: boolean;
+  invoiceAmountCents?: number;
+  invoiceLines?: { lineNumber: number; instructionLineNumber?: number; sku?: string; description: string; quantity: string; unitPriceCents: number }[];
+  approve?: boolean;
+  approver?: AgentTrustAdmin;
+}
 
 export function last4(bank: PaymentDestination): string {
   return bank.type === 'us_ach' ? bank.accountNumber.slice(-4) : bank.iban.slice(-4);
@@ -145,7 +171,10 @@ export async function verifiedSupplier(enteredBy: AgentTrustAdmin, verifiedBy: A
 
 export function purchase(
   agent: Agent,
-  p: { supplierId?: string; payee?: PaymentDestination; amountCents: number; poId?: string; invoiceId?: string; key?: string },
+  p: {
+    supplierId?: string; payee?: PaymentDestination; amountCents: number; poId?: string; invoiceId?: string; instructionId?: string;
+    lines?: { instructionLineNumber: number; sku?: string; quantity: string; unitPriceCents: number }[]; key?: string; currency?: string;
+  },
 ) {
   return agent.client.authorizations.create({
     idempotencyKey: p.key ?? `purchase-${uniq()}`,
@@ -153,9 +182,11 @@ export function purchase(
     supplierId: p.supplierId,
     payee: p.payee ?? BANK_GOOD,
     amountCents: p.amountCents,
-    currency: 'USD',
+    currency: p.currency ?? 'USD',
     purchaseOrderId: p.poId,
     invoiceId: p.invoiceId,
+    purchaseInstructionId: p.instructionId,
+    lines: p.lines,
   });
 }
 
@@ -181,4 +212,29 @@ export async function apiError(p: Promise<unknown>): Promise<AgentTrustError> {
     throw e;
   }
   throw new Error('expected request to fail, but it succeeded');
+}
+
+/** Mints a session the raw way (for hand-built signed requests). */
+export async function rawSession(baseUrl: string, agent: Agent) {
+  const keys = generateEd25519KeyPair();
+  const body = JSON.stringify({ publicKeyPem: keys.publicKeyPem, ttlSeconds: 900 });
+  const headers = { ...signRequest({ credentialId: agent.credentialId, privateKeyPem: agent.privateKeyPem, method: 'POST', path: '/v1/agent-sessions', body }), 'content-type': 'application/json' };
+  const res = await fetch(`${baseUrl}/v1/agent-sessions`, { method: 'POST', headers, body });
+  if (res.status !== 201) throw new Error(`session creation failed: ${res.status}`);
+  const { sessionId } = (await res.json()) as { sessionId: string };
+  return { sessionId, privateKeyPem: keys.privateKeyPem };
+}
+
+export function signedFetch(baseUrl: string, keyId: string, privateKeyPem: string, method: 'GET' | 'POST' | 'PUT', path: string, payload?: unknown) {
+  const body = payload === undefined ? '' : JSON.stringify(payload);
+  const headers: Record<string, string> = signRequest({ credentialId: keyId, privateKeyPem, method, path, body });
+  if (body) headers['content-type'] = 'application/json';
+  return fetch(`${baseUrl}${path}`, { method, headers, body: body || undefined });
+}
+
+/** Creates a new active policy version with `patch` applied to the current rules. */
+export async function patchPolicy(w: World, patch: (rules: Record<string, any>) => Record<string, any>) {
+  const { policies } = await w.admin.get<{ policies: { id: string; status: string; rules: Record<string, any> }[] }>('/v1/policies');
+  const active = policies.find((p) => p.status === 'active')!;
+  await w.admin.put(`/v1/policies/${active.id}`, { rules: patch(structuredClone(active.rules)) });
 }

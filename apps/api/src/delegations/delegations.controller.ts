@@ -85,6 +85,14 @@ export class DelegationsController {
           expiresAt,
         },
       });
+      if (superseded.count > 0) {
+        await invalidateLiveAuthorizations(tx, this.audit, {
+          organizationId: user.organizationId,
+          where: { agentId: agent.id, delegationId: { not: id } },
+          reason: 'delegation superseded',
+          actor: { type: 'user', id: user.userId },
+        });
+      }
       await this.audit.append(tx, {
         organizationId: user.organizationId,
         actorType: 'user',
@@ -103,14 +111,6 @@ export class DelegationsController {
           supersededCount: superseded.count,
         },
       });
-      if (superseded.count > 0) {
-        await invalidateLiveAuthorizations(tx, this.audit, {
-          organizationId: user.organizationId,
-          where: { agentId: agent.id, delegationId: { not: id } },
-          reason: 'delegation superseded',
-          actor: { type: 'user', id: user.userId },
-        });
-      }
       return serializeDelegation(d);
     });
   }
@@ -131,6 +131,12 @@ export class DelegationsController {
       if (!d) throw Errors.notFound('Delegation');
       if (d.revokedAt) throw Errors.conflict('ALREADY_REVOKED', 'Delegation already revoked');
       const updated = await tx.delegation.update({ where: { id }, data: { revokedAt: new Date(), revokedByUserId: user.userId } });
+      await invalidateLiveAuthorizations(tx, this.audit, {
+        organizationId: user.organizationId,
+        where: { delegationId: id },
+        reason: 'delegation revoked',
+        actor: { type: 'user', id: user.userId },
+      });
       await this.audit.append(tx, {
         organizationId: user.organizationId,
         actorType: 'user',
@@ -138,12 +144,6 @@ export class DelegationsController {
         eventType: 'delegation.revoked',
         subjectId: id,
         payload: { agentId: d.agentId },
-      });
-      await invalidateLiveAuthorizations(tx, this.audit, {
-        organizationId: user.organizationId,
-        where: { delegationId: id },
-        reason: 'delegation revoked',
-        actor: { type: 'user', id: user.userId },
       });
       return serializeDelegation(updated);
     });

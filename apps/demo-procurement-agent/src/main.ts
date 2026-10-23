@@ -72,7 +72,7 @@ class GullibleProcurementAgent {
   constructor(readonly name: string, private readonly trust: AgentTrust) {}
 
   /** Proposes a purchase exactly as the documents it read describe it. */
-  propose(p: { supplierId?: string; payee: PaymentDestination; amountCents: number; poId?: string; invoiceId?: string }) {
+  propose(p: { supplierId?: string; payee: PaymentDestination; amountCents: number; poId?: string; invoiceId?: string; instructionId?: string }) {
     return this.trust.authorizations.create({
       idempotencyKey: `demo-${tag()}`,
       action: 'purchase',
@@ -82,6 +82,7 @@ class GullibleProcurementAgent {
       currency: 'USD',
       purchaseOrderId: p.poId,
       invoiceId: p.invoiceId,
+      purchaseInstructionId: p.instructionId,
     });
   }
 
@@ -156,10 +157,24 @@ async function main() {
 
   // Development: the workload key is signed locally. Production: a sidecar/KMS signer outside the LLM's reach.
   const agent = new GullibleProcurementAgent('Procurement Agent #104', new AgentTrust({ baseUrl: BASE_URL, credentialId: reg.credential.id, workloadSigner: localSigner(keys.privateKeyPem) }));
-  const order = async (amountCents: number) => {
-    const po = await sarah.post<{ id: string }>('/v1/purchase-orders', { supplierId: supplier.id, externalReference: `PO-${tag()}`, approvedAmountCents: amountCents, currency: 'USD' });
-    const inv = await sarah.post<{ id: string }>('/v1/invoices', { supplierId: supplier.id, purchaseOrderId: po.id, invoiceNumber: `INV-${tag()}`, amountCents, currency: 'USD' });
-    return { poId: po.id, invoiceId: inv.id };
+  /**
+   * Trusted business setup for one purchase: PO, a purchase instruction
+   * assigned to the agent (requested by Sarah, independently approved by
+   * Priya), and the supplier's invoice with trusted line items.
+   */
+  const order = async (amountCents: number, agentId: string = reg.agent.id, supplierId: string = supplier.id) => {
+    const sku = `CNC-${tag()}`;
+    const po = await sarah.post<{ id: string }>('/v1/purchase-orders', { supplierId, externalReference: `PO-${tag()}`, approvedAmountCents: amountCents, currency: 'USD' });
+    const ins = await sarah.post<{ id: string }>('/v1/purchase-instructions', {
+      agentId, supplierId, purchaseOrderId: po.id, fulfillmentType: 'physical_goods', currency: 'USD', expiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+      lines: [{ lineNumber: 1, sku, description: 'CNC tooling', quantity: '1', unitPriceCents: amountCents }],
+    });
+    await priya.post(`/v1/purchase-instructions/${ins.id}/approve`, {});
+    const inv = await sarah.post<{ id: string }>('/v1/invoices', {
+      supplierId, purchaseOrderId: po.id, purchaseInstructionId: ins.id, invoiceNumber: `INV-${tag()}`, amountCents, currency: 'USD',
+      lines: [{ lineNumber: 1, instructionLineNumber: 1, sku, description: 'CNC tooling', quantity: '1', unitPriceCents: amountCents }],
+    });
+    return { poId: po.id, invoiceId: inv.id, instructionId: ins.id };
   };
 
   // ---- 1 ---------------------------------------------------------------------
@@ -249,8 +264,8 @@ async function main() {
 
   // ---- 10 --------------------------------------------------------------------
   header('10', 'Five simultaneous purchases vs a $1,200 budget');
-  const { bot: agent107 } = await newAgent('Agent #107', 50_000, 120_000);
-  const orders = await Promise.all(Array.from({ length: 5 }, () => order(50_000)));
+  const { id: agent107Id, bot: agent107 } = await newAgent('Agent #107', 50_000, 120_000);
+  const orders = await Promise.all(Array.from({ length: 5 }, () => order(50_000, agent107Id)));
   agentSays('Firing 5 × $500 purchases at the exact same moment…');
   const burst = await Promise.all(orders.map((o) => agent107.propose({ supplierId: supplier.id, payee: realBank, amountCents: 50_000, ...o })));
   const allowed = burst.filter((b) => b.decision === 'ALLOW').length;
@@ -260,7 +275,7 @@ async function main() {
   // ---- 11 --------------------------------------------------------------------
   header('11', 'Graded response: scam spam alerts, forged tokens suspend');
   const { id: rogueId, bot: rogue } = await newAgent('Agent #666', 500_000, 2_000_000);
-  const o11 = await order(50_000);
+  const o11 = await order(50_000, rogueId);
   const legit = await rogue.propose({ supplierId: supplier.id, payee: realBank, amountCents: 50_000, ...o11 });
   agentSays(c.red('(fed scam invoices) "Pay account 9999000011."  ×6'));
   for (let i = 1; i <= 6; i++) await rogue.propose({ supplierId: supplier.id, payee: scamBank, amountCents: 49_000 });
@@ -281,9 +296,8 @@ async function main() {
   // ---- 12 --------------------------------------------------------------------
   header('12', 'Supplier bank details change AFTER authorization');
   const midwest = await onboard('Midwest Bearings', unknownBank, '1111');
-  const po12 = await sarah.post<{ id: string }>('/v1/purchase-orders', { supplierId: midwest.id, externalReference: `PO-${tag()}`, approvedAmountCents: 50_000, currency: 'USD' });
-  const inv12 = await sarah.post<{ id: string }>('/v1/invoices', { supplierId: midwest.id, purchaseOrderId: po12.id, invoiceNumber: `INV-${tag()}`, amountCents: 50_000, currency: 'USD' });
-  const a12 = await agent.propose({ supplierId: midwest.id, payee: unknownBank, amountCents: 50_000, poId: po12.id, invoiceId: inv12.id });
+  const o12m = await order(50_000, reg.agent.id, midwest.id);
+  const a12 = await agent.propose({ supplierId: midwest.id, payee: unknownBank, amountCents: 50_000, ...o12m });
   showDecision(a12);
   console.log(`  🕵️  ${c.dim('compromised employee account (fresh login):')} changes Midwest Bearings' bank to ••••0011`);
   await sarah.patch(`/v1/suppliers/${midwest.id}`, { paymentDestination: scamBank });
@@ -309,8 +323,8 @@ async function main() {
 
   // ---- 14 --------------------------------------------------------------------
   header('14', 'Human approves after the delegation was revoked');
-  const { delegationId: dlg108, bot: agent108 } = await newAgent('Agent #108', 500_000, 2_000_000);
-  const o14 = await order(300_000);
+  const { id: id108, delegationId: dlg108, bot: agent108 } = await newAgent('Agent #108', 500_000, 2_000_000);
+  const o14 = await order(300_000, id108);
   const a14 = await agent108.propose({ supplierId: supplier.id, payee: realBank, amountCents: 300_000, ...o14 });
   showDecision(a14);
   console.log(`  👩‍💼 ${c.dim('Priya:')} revokes Agent #108's purchasing authority…`);

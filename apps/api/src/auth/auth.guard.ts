@@ -3,12 +3,21 @@ import { Reflector } from '@nestjs/core';
 import { Prisma } from '@prisma/client';
 import type { Request } from 'express';
 import { parseEd25519PublicKey, parseSignatureHeaders, verifyRequestSignature } from '@agenttrust/identity';
-import { safeEqual } from '@agenttrust/shared';
+import { safeEqual, sha256Hex } from '@agenttrust/shared';
 import { APP_CONFIG, type AppConfig } from '../config';
 import { cents, PrismaService } from '../common/prisma.service';
 import { Errors } from '../common/errors';
 import { SecurityMonitorService } from '../security/security-monitor.service';
-import { ACCESS_KEY, FRESH_AUTH_KEY, type AccessRule, type AgentPrincipal, type HumanPrincipal, type Principal } from './principal';
+import {
+  ACCESS_KEY,
+  FRESH_AUTH_KEY,
+  type AccessRule,
+  type AgentPrincipal,
+  type HumanPrincipal,
+  type IntegrationPrincipal,
+  type IntegrationScope,
+  type Principal,
+} from './principal';
 import { HUMAN_TOKEN_VERIFIER, type HumanTokenVerifier } from './human-token';
 
 type AuthedRequest = Request & { principal?: Principal; rawBody?: Buffer };
@@ -78,7 +87,43 @@ export class AuthGuard implements CanActivate {
       case 'human_or_agent':
         req.principal = req.header('authorization') ? await this.authenticateHuman(req) : await this.authenticateAgent(req, 'session');
         return true;
+      case 'integration':
+        req.principal = await this.authenticateIntegration(req, rule.scope);
+        return true;
+      case 'human_or_integration': {
+        if (/^Bearer itk_/.test(req.header('authorization') ?? '')) {
+          req.principal = await this.authenticateIntegration(req, rule.scope);
+          return true;
+        }
+        const human = await this.authenticateHuman(req);
+        if (rule.roles.length > 0 && !rule.roles.includes(human.role)) {
+          throw Errors.forbidden('ROLE_REQUIRED', `Requires role: ${rule.roles.join(' or ')}`);
+        }
+        this.checkFreshAuth(ctx, human);
+        req.principal = human;
+        return true;
+      }
     }
+  }
+
+  /** ERP integrations: `Bearer itk_<id>.<secret>`; secret is compared by SHA-256 in constant time. */
+  private async authenticateIntegration(req: AuthedRequest, scope: IntegrationScope): Promise<IntegrationPrincipal> {
+    const m = /^Bearer (int_[a-f0-9]{32})\.([A-Za-z0-9_-]{43})$/.exec((req.header('authorization') ?? '').replace('Bearer itk_', 'Bearer '));
+    if (!m) throw Errors.unauthenticated('Integration credential required');
+    const integration = await this.prisma.integration.findUnique({ where: { id: m[1]! } });
+    if (!integration || integration.status !== 'active' || !safeEqual(sha256Hex(m[2]!), integration.secretHash)) {
+      throw Errors.unauthenticated('Invalid or revoked integration credential');
+    }
+    const org = await this.prisma.organization.findUnique({ where: { id: integration.organizationId } });
+    if (!org || org.status !== 'active') throw Errors.forbidden('ORGANIZATION_SUSPENDED', 'Organization is not active');
+    if (!integration.scopes.includes(scope)) throw Errors.forbidden('SCOPE_REQUIRED', `Integration lacks scope ${scope}`);
+    return {
+      kind: 'integration',
+      integrationId: integration.id,
+      organizationId: integration.organizationId,
+      sourceSystem: integration.sourceSystem,
+      scopes: integration.scopes as IntegrationScope[],
+    };
   }
 
   private checkFreshAuth(ctx: ExecutionContext, human: HumanPrincipal): void {

@@ -1,6 +1,27 @@
 import type { ReasonCode } from '@agenttrust/shared';
 
+export type ReceiptRequirement = 'confirmation_required' | 'human_approval' | 'none';
+
+export interface ThreeWayMatchRules {
+  /** When false, no receipt/completion confirmation is required for any purchase. */
+  enabled: boolean;
+  physicalGoods: ReceiptRequirement;
+  services: ReceiptRequirement;
+  subscription: ReceiptRequirement;
+  digitalGoods: ReceiptRequirement;
+}
+
 export interface PolicyRules {
+  /**
+   * What to do when a purchase does not reference an independently approved
+   * purchase instruction. Never ALLOW. A REVIEW here is NOT click-approvable:
+   * a human must create and approve an instruction, then the agent resubmits.
+   */
+  missingInstruction: 'REVIEW' | 'DENY';
+  /** Three-way match (PO → receipt → invoice) requirements by fulfillment type. */
+  threeWayMatch: ThreeWayMatchRules;
+  /** What to do when a required receipt/completion confirmation is missing or short. Never ALLOW. */
+  missingReceipt: 'REVIEW' | 'DENY';
   /** What to do when a purchase does not reference a purchase order. */
   missingPurchaseOrder: 'REVIEW' | 'DENY';
   /** What to do when a purchase does not reference an invoice. */
@@ -36,8 +57,17 @@ export interface SecurityResponseRules {
 }
 
 export const DEFAULT_POLICY_RULES: PolicyRules = {
+  missingInstruction: 'REVIEW',
+  threeWayMatch: {
+    enabled: false,
+    physicalGoods: 'confirmation_required',
+    services: 'confirmation_required',
+    subscription: 'human_approval',
+    digitalGoods: 'none',
+  },
+  missingReceipt: 'REVIEW',
   missingPurchaseOrder: 'REVIEW',
-  missingInvoice: 'ALLOW',
+  missingInvoice: 'REVIEW', // invoice required by default (never auto-ALLOW without one)
   unknownSupplier: 'REVIEW',
   reviewThresholdCents: 250_000, // $2,500
   authorizationTtlSeconds: 600, // 10 minutes
@@ -63,6 +93,12 @@ export interface PolicyFacts {
   purchaseOrder: PurchaseOrderFacts | null;
   /** null when not referenced OR referenced but not found (see request.invoiceId). */
   invoice: InvoiceFacts | null;
+  /** null when not referenced OR referenced but not found (see request.purchaseInstructionId). */
+  instruction: InstructionFacts | null;
+  /** What has already been used of the instruction (consumed + live holds, excluding this request). */
+  instructionUsage: { uses: number; amountCents: number; quantityMilliByLine: Record<number, number> };
+  /** Non-voided receipts / completion confirmations recorded against the instruction. */
+  receipts: { type: string; lines: { instructionLineNumber: number; quantityMilli: number }[] }[];
   /** True when another live authorization already holds this invoice. */
   invoiceInFlight: boolean;
   /** Spend this calendar month under the delegation: paid + active reservations (excluding this request). */
@@ -71,7 +107,35 @@ export interface PolicyFacts {
   humanApprovalGranted: boolean;
 }
 
+export interface PaymentLineFacts {
+  instructionLineNumber: number | null;
+  sku: string | null;
+  quantityMilli: number;
+  unitPriceCents: number;
+  lineTotalCents: number;
+}
+
+export interface InstructionFacts {
+  id: string;
+  version: number;
+  status: 'pending_approval' | 'approved' | 'rejected' | 'revoked';
+  agentId: string;
+  supplierId: string;
+  purchaseOrderId: string | null;
+  fulfillmentType: 'physical_goods' | 'services' | 'subscription' | 'digital_goods';
+  currency: string;
+  maxAmountCents: number;
+  maxUses: number;
+  validFrom: Date;
+  expiresAt: Date;
+  lines: { lineNumber: number; sku: string | null; quantityMilli: number; unitPriceCents: number }[];
+}
+
 export interface PurchaseRequestFacts {
+  agentId: string;
+  purchaseInstructionId: string | null;
+  /** Agent-supplied lines (untrusted; only used when the invoice has no lines). */
+  lines: PaymentLineFacts[] | null;
   action: string;
   supplierId: string | null;
   amountCents: number;
@@ -117,6 +181,9 @@ export interface InvoiceFacts {
   purchaseOrderId: string | null;
   amountCents: number;
   currency: string;
+  instructionId: string | null;
+  /** Trusted lines recorded by humans/ERP (may be empty for legacy invoices). */
+  lines: PaymentLineFacts[];
   /** `processing` = a payment for it is executing or being reconciled. */
   status: 'open' | 'processing' | 'paid' | 'void';
 }
@@ -130,4 +197,6 @@ export interface PolicyResult {
   policyVersion: number | null;
   /** True when every remaining REVIEW check can be resolved by a human approver. */
   approvable: boolean;
+  /** The exact lines this decision covers (from the invoice, else from the request). */
+  paymentLines: PaymentLineFacts[] | null;
 }

@@ -18,7 +18,7 @@ import { ed25519Verify, type Signer } from '@agenttrust/identity';
  * must additionally anchor chain heads in write-once storage (e.g. S3 Object
  * Lock) and keep the signing key in a KMS/HSM.
  */
-export type ActorType = 'agent' | 'user' | 'system';
+export type ActorType = 'agent' | 'user' | 'system' | 'integration';
 
 export interface AuditEventDraft {
   id: string;

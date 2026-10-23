@@ -20,7 +20,21 @@ const SecurityResponseSchema = z
   })
   .strict();
 
+const ReceiptRequirementSchema = z.enum(['confirmation_required', 'human_approval', 'none']);
+const ThreeWayMatchSchema = z
+  .object({
+    enabled: z.boolean(),
+    physicalGoods: ReceiptRequirementSchema,
+    services: ReceiptRequirementSchema,
+    subscription: ReceiptRequirementSchema,
+    digitalGoods: ReceiptRequirementSchema,
+  })
+  .strict();
+
 const rulesShape = {
+  missingInstruction: z.enum(['REVIEW', 'DENY']),
+  threeWayMatch: ThreeWayMatchSchema,
+  missingReceipt: z.enum(['REVIEW', 'DENY']),
   missingPurchaseOrder: z.enum(['REVIEW', 'DENY']),
   missingInvoice: z.enum(['ALLOW', 'REVIEW', 'DENY']),
   unknownSupplier: z.enum(['REVIEW', 'DENY']),
@@ -34,7 +48,14 @@ const rulesShape = {
 export const PolicyRulesSchema = z.object(rulesShape).strict();
 
 /** Rules read back from storage: tolerant of retired keys; older versions get default security responses. */
-const StoredRulesSchema = z.object({ ...rulesShape, securityResponse: SecurityResponseSchema.default(DEFAULT_POLICY_RULES.securityResponse) });
+const StoredRulesSchema = z.object({
+  ...rulesShape,
+  securityResponse: SecurityResponseSchema.default(DEFAULT_POLICY_RULES.securityResponse),
+  // Policies stored before v0.3 get the (strict) v0.3 defaults: instructions required, invoice required.
+  missingInstruction: rulesShape.missingInstruction.default(DEFAULT_POLICY_RULES.missingInstruction),
+  threeWayMatch: ThreeWayMatchSchema.default(DEFAULT_POLICY_RULES.threeWayMatch),
+  missingReceipt: rulesShape.missingReceipt.default(DEFAULT_POLICY_RULES.missingReceipt),
+});
 
 const CreatePolicy = z.object({ name: z.string().min(1).max(200), rules: PolicyRulesSchema }).strict();
 const UpdatePolicy = z.object({ name: z.string().min(1).max(200).optional(), rules: PolicyRulesSchema }).strict();
@@ -88,6 +109,13 @@ export class PoliciesController {
     const policy = await tx.policy.create({
       data: { id: newId(IdPrefix.policy), organizationId: admin.organizationId, name, version, rules: rules as unknown as Prisma.InputJsonObject, status: 'active', createdByUserId: admin.userId },
     });
+    // Authorizations issued under the previous version are no longer valid.
+    await invalidateLiveAuthorizations(tx, this.audit, {
+      organizationId: admin.organizationId,
+      where: { policyId: { not: policy.id } },
+      reason: `policy changed to v${version}`,
+      actor: { type: 'user', id: admin.userId },
+    });
     await this.audit.append(tx, {
       organizationId: admin.organizationId,
       actorType: 'user',
@@ -95,13 +123,6 @@ export class PoliciesController {
       eventType: 'policy.version_created',
       subjectId: policy.id,
       payload: { version, name, rules: rules as unknown as Record<string, unknown> },
-    });
-    // Authorizations issued under the previous version are no longer valid.
-    await invalidateLiveAuthorizations(tx, this.audit, {
-      organizationId: admin.organizationId,
-      where: { policyId: { not: policy.id } },
-      reason: `policy changed to v${version}`,
-      actor: { type: 'user', id: admin.userId },
     });
     return policy;
   }

@@ -21,12 +21,17 @@ const binding: AuthorizationBinding = {
   currency: 'USD',
   purchaseOrderId: 'po_200',
   invoiceId: 'inv_900',
+  purchaseInstructionId: 'pin_1',
+  requestLinesHash: null,
   paymentRail: 'ach',
   destinationRef: 'cp_100_v1',
   supplierVersion: 1,
   policyId: 'pol_1',
   policyVersion: 3,
   delegationId: 'dlg_1',
+  instructionId: 'pin_1',
+  instructionVersion: 1,
+  linesHash: 'ln_abc',
 };
 
 function setup() {
@@ -67,6 +72,8 @@ describe('authorization tokens', () => {
       [{ policyVersion: 4 }, 'policyVersion'],
       [{ delegationId: 'dlg_2' }, 'delegation'],
       [{ currency: 'EUR' }, 'currency'],
+      [{ instructionVersion: 2 }, 'instructionVersion'],
+      [{ linesHash: 'ln_substituted' }, 'lines'],
     ];
     for (const [change, field] of cases) {
       const m = tokenMismatches(r.claims, { ...binding, ...change });

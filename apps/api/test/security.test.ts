@@ -56,15 +56,15 @@ describe('tenant isolation', () => {
   });
 
   it('an agent cannot use another organization\'s supplier, PO or invoice', async () => {
-    const { poId, invoiceId } = await acme.poAndInvoice(50_000);
-    const r = await purchase(globexAgent, { supplierId: acme.supplierId, amountCents: 50_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await acme.order(acmeAgent, 50_000);
+    const r = await purchase(globexAgent, { supplierId: acme.supplierId, amountCents: 50_000, poId, invoiceId, instructionId });
     expect(r.decision).toBe('DENY');
-    expect(r.reasonCodes).toEqual(expect.arrayContaining(['SUPPLIER_UNKNOWN', 'PO_NOT_FOUND', 'INVOICE_NOT_FOUND']));
+    expect(r.reasonCodes).toEqual(expect.arrayContaining(['SUPPLIER_UNKNOWN', 'PO_NOT_FOUND', 'INVOICE_NOT_FOUND', 'INSTRUCTION_NOT_FOUND']));
   });
 
   it('an agent cannot execute another agent\'s authorization', async () => {
-    const { poId, invoiceId } = await acme.poAndInvoice(50_000);
-    const auth = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 50_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await acme.order(acmeAgent, 50_000);
+    const auth = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 50_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('ALLOW');
     expect((await apiError(executeFor(globexAgent, auth))).code).toBe('TOKEN_NOT_ISSUED_TO_CALLER');
     const sibling = await acme.createAgent('Acme Sibling', { maxTransactionCents: 500_000, monthlyLimitCents: 2_000_000 });
@@ -152,8 +152,8 @@ describe('security responses are graded (no denial-of-service by outsiders)', ()
     expect(alerts.some((a) => a.category === 'auth_failures' && a.subjectId === victim.id)).toBe(true);
 
     // The legitimate agent keeps working.
-    const { poId, invoiceId } = await acme.poAndInvoice(10_000);
-    expect((await purchase(victim, { supplierId: acme.supplierId, amountCents: 10_000, poId, invoiceId })).decision).toBe('ALLOW');
+    const { poId, invoiceId, instructionId } = await acme.order(victim, 10_000);
+    expect((await purchase(victim, { supplierId: acme.supplierId, amountCents: 10_000, poId, invoiceId, instructionId })).decision).toBe('ALLOW');
   });
 
   it('repeated business-policy denials raise an alert but never suspend', async () => {
@@ -238,16 +238,16 @@ describe('supplier records are high-risk', () => {
 
   it('a pending supplier gets REVIEW that cannot be click-approved', async () => {
     const s = await acme.admin.post<{ id: string }>('/v1/suppliers', { name: `Pending ${uniq()}`, paymentDestination: BANK_GOOD });
-    const { poId, invoiceId } = await acme.poAndInvoice(10_000, s.id);
-    const r = await purchase(acmeAgent, { supplierId: s.id, amountCents: 10_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await acme.order(acmeAgent, 10_000, { supplierId: s.id });
+    const r = await purchase(acmeAgent, { supplierId: s.id, amountCents: 10_000, poId, invoiceId, instructionId });
     expect(r.decision).toBe('REVIEW');
     expect(r.approvable).toBe(false);
   });
 
   it('any supplier record change (even a rename) invalidates live authorizations', async () => {
     const id = await acme.verifiedSupplier(`Rename ${uniq()}`, BANK_OTHER_SUPPLIER);
-    const { poId, invoiceId } = await acme.poAndInvoice(10_000, id);
-    const auth = await purchase(acmeAgent, { supplierId: id, payee: BANK_OTHER_SUPPLIER, amountCents: 10_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await acme.order(acmeAgent, 10_000, { supplierId: id });
+    const auth = await purchase(acmeAgent, { supplierId: id, payee: BANK_OTHER_SUPPLIER, amountCents: 10_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('ALLOW');
     await acme.admin.patch(`/v1/suppliers/${id}`, { name: 'Renamed Supplier LLC' });
     expect((await apiError(executeFor(acmeAgent, auth))).code).toBe('AUTHORIZATION_INVALIDATED');
@@ -256,20 +256,20 @@ describe('supplier records are high-risk', () => {
 
 describe('idempotency and duplicates', () => {
   it('same key + same transaction returns the same authorization; a different transaction conflicts', async () => {
-    const { poId, invoiceId } = await acme.poAndInvoice(20_000);
+    const { poId, invoiceId, instructionId } = await acme.order(acmeAgent, 20_000);
     const key = `idem-${uniq()}`;
-    const a = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 20_000, poId, invoiceId, key });
-    const b = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 20_000, poId, invoiceId, key });
+    const a = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 20_000, poId, invoiceId, instructionId, key });
+    const b = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 20_000, poId, invoiceId, instructionId, key });
     expect(b.id).toBe(a.id);
-    const c = await apiError(purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 19_999, poId, invoiceId, key }));
+    const c = await apiError(purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 19_999, poId, invoiceId, instructionId, key }));
     expect(c.code).toBe('IDEMPOTENCY_CONFLICT');
   });
 
   it('the same invoice cannot be held by two live authorizations', async () => {
-    const { poId, invoiceId } = await acme.poAndInvoice(20_000);
-    const first = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 20_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await acme.order(acmeAgent, 20_000);
+    const first = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 20_000, poId, invoiceId, instructionId });
     expect(first.decision).toBe('ALLOW');
-    const second = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 20_000, poId, invoiceId });
+    const second = await purchase(acmeAgent, { supplierId: acme.supplierId, amountCents: 20_000, poId, invoiceId, instructionId });
     expect(second.decision).toBe('DENY');
     expect(second.reasonCodes).toContain('INVOICE_IN_FLIGHT');
   });
@@ -299,8 +299,8 @@ describe('input validation and delegation scope', () => {
 
   it('a revoked delegation stops spending immediately, including already-issued authorizations', async () => {
     const a = await acme.createAgent('Revocable', { maxTransactionCents: 100_000, monthlyLimitCents: 100_000 });
-    const { poId, invoiceId } = await acme.poAndInvoice(10_000);
-    const auth = await purchase(a, { supplierId: acme.supplierId, amountCents: 10_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await acme.order(a, 10_000);
+    const auth = await purchase(a, { supplierId: acme.supplierId, amountCents: 10_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('ALLOW');
     const delegation = await prisma.delegation.findFirstOrThrow({ where: { agentId: a.id } });
     await acme.approver.post(`/v1/delegations/${delegation.id}/revoke`, {});
@@ -310,8 +310,8 @@ describe('input validation and delegation scope', () => {
   it('supplier-scoped delegations deny other suppliers', async () => {
     const otherId = await acme.verifiedSupplier(`Not Allowed ${uniq()}`, BANK_ATTACKER);
     const scoped = await acme.createAgent('Scoped', { maxTransactionCents: 100_000, monthlyLimitCents: 100_000, approvedSupplierIds: [acme.supplierId] });
-    const { poId, invoiceId } = await acme.poAndInvoice(10_000, otherId);
-    const r = await purchase(scoped, { supplierId: otherId, payee: BANK_ATTACKER, amountCents: 10_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await acme.order(scoped, 10_000, { supplierId: otherId });
+    const r = await purchase(scoped, { supplierId: otherId, payee: BANK_ATTACKER, amountCents: 10_000, poId, invoiceId, instructionId });
     expect(r.decision).toBe('DENY');
     expect(r.reasonCodes).toContain('SUPPLIER_NOT_DELEGATED');
   });

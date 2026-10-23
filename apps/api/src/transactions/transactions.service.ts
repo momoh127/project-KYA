@@ -1,7 +1,7 @@
 import { HttpStatus, Inject, Injectable, Logger } from '@nestjs/common';
 import type { Transaction, TransactionStatus } from '@prisma/client';
 import { tokenMismatches, verifyAuthorizationToken, type AuthorizationClaims } from '@agenttrust/authorization';
-import { IdPrefix, newId } from '@agenttrust/shared';
+import { IdPrefix, newId, type PaymentLine } from '@agenttrust/shared';
 import type { AgentPrincipal, HumanPrincipal } from '../auth/principal';
 import { AuditService } from '../audit/audit.service';
 import { intentFromRow } from '../authorizations/authorizations.service';
@@ -154,8 +154,22 @@ export class TransactionsService {
         throw new GatewayRejection('SUPPLIER_RECORD_CHANGED', `Supplier record changed (v${claims.sv} → v${supplier.version}) after authorization`);
       }
 
+      // The independently approved business instruction must still be valid, unchanged and assigned to this agent.
+      const instruction = auth.instructionId
+        ? await tx.purchaseInstruction.findFirst({ where: { id: auth.instructionId, organizationId: agent.organizationId } })
+        : null;
+      if (!instruction || instruction.status !== 'approved') {
+        throw new GatewayRejection('INSTRUCTION_NO_LONGER_APPROVED', `Purchase instruction is ${instruction?.status ?? 'missing'}`);
+      }
+      if (instruction.version !== claims.iv) {
+        throw new GatewayRejection('INSTRUCTION_CHANGED', `Purchase instruction changed (v${claims.iv} → v${instruction.version}) after authorization`);
+      }
+      if (instruction.expiresAt <= now) throw new GatewayRejection('INSTRUCTION_EXPIRED', 'Purchase instruction has expired');
+      if (instruction.agentId !== agent.agentId) throw new GatewayRejection('INSTRUCTION_AGENT_MISMATCH', 'Purchase instruction is assigned to a different agent');
+      const paidLines = (auth.lines as PaymentLine[] | null) ?? null;
+
       // Catch-all: the complete instruction rebuilt from current records must equal what was signed.
-      const binding = buildBinding(intentFromRow(auth), supplier, policy, delegation);
+      const binding = buildBinding(intentFromRow(auth), supplier, policy, delegation, instruction, paidLines);
       const mismatches = binding ? tokenMismatches(claims, binding) : ['binding'];
       if (mismatches.length || auth.authorizationFingerprint !== claims.fp) {
         throw new GatewayRejection('AUTHORIZATION_BINDING_CHANGED', 'The payment instruction no longer matches what was authorized', { mismatchedFields: mismatches });

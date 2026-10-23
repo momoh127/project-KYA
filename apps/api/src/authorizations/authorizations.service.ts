@@ -5,11 +5,16 @@ import { claimsFromBinding, signAuthorizationToken } from '@agenttrust/authoriza
 import { evaluatePurchase, type PolicyResult } from '@agenttrust/policy-engine';
 import {
   authorizationFingerprint,
+  exactLineTotal,
   IdPrefix,
+  linesHash,
   newId,
+  parseQuantity,
+  toSafeNumber,
   transactionFingerprint,
   type AuthorizationBinding,
   type PaymentDestination,
+  type PaymentLine,
   type TransactionIntent,
 } from '@agenttrust/shared';
 import type { AgentPrincipal, HumanPrincipal } from '../auth/principal';
@@ -18,7 +23,7 @@ import { CryptoService } from '../common/crypto.service';
 import { Errors } from '../common/errors';
 import { cents, PrismaService, type Tx } from '../common/prisma.service';
 import { SecurityMonitorService } from '../security/security-monitor.service';
-import { buildBinding } from './binding';
+import { buildBinding, toPaymentLines } from './binding';
 import { FactsLoader, type LoadedFacts } from './facts.loader';
 
 export interface CreateAuthorizationBody {
@@ -30,6 +35,31 @@ export interface CreateAuthorizationBody {
   currency: string;
   purchaseOrderId?: string;
   invoiceId?: string;
+  purchaseInstructionId?: string;
+  /** Agent-supplied lines; only used when the invoice carries no lines. */
+  lines?: { instructionLineNumber: number; sku?: string; quantity: string; unitPriceCents: number }[];
+}
+
+/** Parses agent-supplied lines with exact arithmetic (rejects totals that would need rounding). */
+function parseRequestLines(lines: CreateAuthorizationBody['lines']): PaymentLine[] | null {
+  if (!lines || lines.length === 0) return null;
+  return lines.map((l) => {
+    let quantityMilli: bigint;
+    try {
+      quantityMilli = parseQuantity(l.quantity);
+    } catch (e) {
+      throw Errors.invalid(`Line ${l.instructionLineNumber}: ${e instanceof Error ? e.message : 'invalid quantity'}`);
+    }
+    const total = exactLineTotal(quantityMilli, BigInt(l.unitPriceCents));
+    if (total === null) throw Errors.invalid(`Line ${l.instructionLineNumber}: quantity × unit price is not an exact number of cents`);
+    return {
+      instructionLineNumber: l.instructionLineNumber,
+      sku: l.sku ?? null,
+      quantityMilli: toSafeNumber(quantityMilli),
+      unitPriceCents: l.unitPriceCents,
+      lineTotalCents: toSafeNumber(total),
+    };
+  });
 }
 
 const STATUS_FOR: Record<PolicyResult['decision'], Authorization['status']> = {
@@ -72,7 +102,11 @@ export class AuthorizationsService {
       currency: body.currency,
       purchaseOrderId: body.purchaseOrderId ?? null,
       invoiceId: body.invoiceId ?? null,
+      purchaseInstructionId: body.purchaseInstructionId ?? null,
+      requestLinesHash: null,
     };
+    const requestLines = parseRequestLines(body.lines);
+    intent.requestLinesHash = requestLines ? linesHash(requestLines) : null;
     const fingerprint = transactionFingerprint(intent);
 
     const prior = await this.findByIdempotencyKey(agent.agentId, body.idempotencyKey);
@@ -82,7 +116,7 @@ export class AuthorizationsService {
     try {
       row = await this.prisma.tx(async (tx) => {
         const now = new Date();
-        const loaded = await this.facts.load(tx, intent, { now, excludeAuthorizationId: null, humanApprovalGranted: false });
+        const loaded = await this.facts.load(tx, intent, { now, excludeAuthorizationId: null, humanApprovalGranted: false, requestLines });
         const result = evaluatePurchase(loaded.facts);
         return this.persistDecision(tx, agent, body.idempotencyKey, intent, fingerprint, loaded, result, now);
       });
@@ -116,8 +150,9 @@ export class AuthorizationsService {
     let token: string | null = null;
     let tokenNonce: string | null = null;
     let binding: AuthorizationBinding | null = null;
+    const paidLines = toPaymentLines(result.paymentLines);
     if (result.decision === 'ALLOW') {
-      binding = buildBinding(intent, loaded.supplier, loaded.policy, loaded.delegation);
+      binding = buildBinding(intent, loaded.supplier, loaded.policy, loaded.delegation, loaded.instruction, paidLines);
       if (!binding) throw new Error('invariant: ALLOW without a complete payment binding');
       ({ token, tokenNonce } = this.issueToken(id, binding, agent.sessionId, now, expiresAt));
     }
@@ -145,6 +180,10 @@ export class AuthorizationsService {
         currency: intent.currency,
         purchaseOrderId: intent.purchaseOrderId,
         invoiceId: intent.invoiceId,
+        instructionId: intent.purchaseInstructionId,
+        instructionVersion: loaded.instruction?.version ?? null,
+        lines: paidLines ? (paidLines as unknown as Prisma.InputJsonArray) : Prisma.JsonNull,
+        linesHash: paidLines ? linesHash(paidLines) : null,
         initialDecision: result.decision,
         decision: result.decision,
         status: STATUS_FOR[result.decision],
@@ -169,6 +208,8 @@ export class AuthorizationsService {
           delegationId: loaded.delegation.id,
           purchaseOrderId: intent.purchaseOrderId,
           invoiceId: intent.invoiceId,
+          instructionId: loaded.instruction ? intent.purchaseInstructionId : null,
+          lines: paidLines ? (paidLines.map((l) => ({ instructionLineNumber: l.instructionLineNumber, quantityMilli: l.quantityMilli })) as Prisma.InputJsonArray) : Prisma.JsonNull,
           amountCents: BigInt(intent.amountCents),
           currency: intent.currency,
           status: 'active',
@@ -240,7 +281,8 @@ export class AuthorizationsService {
 
       const now = new Date();
       const intent = intentFromRow(auth);
-      const loaded = await this.facts.load(tx, intent, { now, excludeAuthorizationId: auth.id, humanApprovalGranted: true });
+      const requestLines = intentLinesFromRow(auth);
+      const loaded = await this.facts.load(tx, intent, { now, excludeAuthorizationId: auth.id, humanApprovalGranted: true, requestLines });
       const result = evaluatePurchase(loaded.facts);
 
       if (result.decision === 'REVIEW') {
@@ -266,8 +308,9 @@ export class AuthorizationsService {
       }
 
       const expiresAt = new Date(now.getTime() + loaded.rules!.authorizationTtlSeconds * 1000);
-      // Bind to the CURRENT supplier version, policy version and delegation.
-      const binding = buildBinding(intent, loaded.supplier, loaded.policy, loaded.delegation);
+      // Bind to the CURRENT supplier version, policy version, delegation and instruction version.
+      const paidLines = toPaymentLines(result.paymentLines);
+      const binding = buildBinding(intent, loaded.supplier, loaded.policy, loaded.delegation, loaded.instruction, paidLines);
       if (!binding) throw new Error('invariant: ALLOW without a complete payment binding');
       const { token, tokenNonce } = this.issueToken(auth.id, binding, auth.sessionId, now, expiresAt);
       const updated = await tx.authorization.update({
@@ -278,16 +321,19 @@ export class AuthorizationsService {
           token, tokenNonce, expiresAt,
           authorizationFingerprint: authorizationFingerprint(binding),
           supplierVersion: binding.supplierVersion, paymentRail: binding.paymentRail, destinationRef: binding.destinationRef,
+          instructionVersion: binding.instructionVersion, linesHash: binding.linesHash, lines: paidLines as unknown as Prisma.InputJsonArray,
           delegationId: binding.delegationId, policyId: binding.policyId, policyVersion: binding.policyVersion,
         },
       });
+      const heldLines = paidLines!.map((l) => ({ instructionLineNumber: l.instructionLineNumber, quantityMilli: l.quantityMilli })) as Prisma.InputJsonArray;
       await tx.budgetReservation.upsert({
         where: { authorizationId: auth.id },
-        update: { status: 'active', expiresAt },
+        update: { status: 'active', expiresAt, instructionId: binding.instructionId, lines: heldLines },
         create: {
           id: newId(IdPrefix.reservation), organizationId: user.organizationId, authorizationId: auth.id,
           agentId: auth.agentId, delegationId: loaded.delegation!.id, purchaseOrderId: auth.purchaseOrderId,
-          invoiceId: auth.invoiceId, amountCents: auth.amountCents, currency: auth.currency, status: 'active', expiresAt,
+          invoiceId: auth.invoiceId, instructionId: binding.instructionId, lines: heldLines,
+          amountCents: auth.amountCents, currency: auth.currency, status: 'active', expiresAt,
         },
       });
       await tx.approval.create({
@@ -360,7 +406,14 @@ export function intentFromRow(a: Authorization): TransactionIntent {
     currency: a.currency,
     purchaseOrderId: a.purchaseOrderId,
     invoiceId: a.invoiceId,
+    purchaseInstructionId: a.instructionId,
+    requestLinesHash: null,
   };
+}
+
+/** Lines the agent originally supplied (stored on the authorization), for re-evaluation at approval time. */
+function intentLinesFromRow(a: Authorization): PaymentLine[] | null {
+  return (a.lines as PaymentLine[] | null) ?? null;
 }
 
 function decisionPayload(
@@ -414,6 +467,9 @@ export function toView(a: Authorization, opts: { includeToken: boolean }) {
     supplierId: a.supplierId,
     purchaseOrderId: a.purchaseOrderId,
     invoiceId: a.invoiceId,
+    purchaseInstructionId: a.instructionId,
+    instructionVersion: a.instructionVersion,
+    lines: a.lines,
     expiresAt: a.expiresAt.toISOString(),
     consumedAt: a.consumedAt?.toISOString() ?? null,
     invalidatedReason: a.invalidatedReason,

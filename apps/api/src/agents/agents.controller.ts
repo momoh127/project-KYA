@@ -4,7 +4,7 @@ import { parseEd25519PublicKey } from '@agenttrust/identity';
 import { IdPrefix, newId } from '@agenttrust/shared';
 import { CurrentUser, Human, type HumanPrincipal } from '../auth/principal';
 import { AuditService } from '../audit/audit.service';
-import { invalidateLiveAuthorizations } from '../authorizations/invalidation';
+import { invalidateLiveAuthorizations, lockLiveAuthorizationsBy } from '../authorizations/invalidation';
 import { Errors } from '../common/errors';
 import { PrismaService } from '../common/prisma.service';
 import { ZodPipe, zId } from '../common/validation';
@@ -98,19 +98,13 @@ export class AgentsController {
 
   private setStatus(admin: HumanPrincipal, id: string, status: 'active' | 'revoked', reason: string) {
     return this.prisma.tx(async (tx) => {
+      // Lock order: Authorization rows → Agent → AuditChainHead (same as the approval path).
+      if (status === 'revoked') await lockLiveAuthorizationsBy(tx, 'agentId', id);
       const agent = await tx.agent.findFirst({ where: { id, organizationId: admin.organizationId } });
       if (!agent) throw Errors.notFound('Agent');
       if (agent.status === 'revoked') throw Errors.conflict('AGENT_REVOKED', 'Revoked agents cannot be changed');
       if (status === 'active' && agent.status !== 'suspended') throw Errors.conflict('NOT_SUSPENDED', 'Agent is not suspended');
       const updated = await tx.agent.update({ where: { id }, data: { status, statusReason: reason } });
-      await this.audit.append(tx, {
-        organizationId: admin.organizationId,
-        actorType: 'user',
-        actorId: admin.userId,
-        eventType: status === 'revoked' ? 'agent.revoked' : 'agent.reactivated',
-        subjectId: id,
-        payload: { previousStatus: agent.status, reason },
-      });
       if (status === 'revoked') {
         await tx.agentSession.updateMany({ where: { agentId: id, revokedAt: null }, data: { revokedAt: new Date() } });
         await invalidateLiveAuthorizations(tx, this.audit, {
@@ -120,6 +114,14 @@ export class AgentsController {
           actor: { type: 'user', id: admin.userId },
         });
       }
+      await this.audit.append(tx, {
+        organizationId: admin.organizationId,
+        actorType: 'user',
+        actorId: admin.userId,
+        eventType: status === 'revoked' ? 'agent.revoked' : 'agent.reactivated',
+        subjectId: id,
+        payload: { previousStatus: agent.status, reason },
+      });
       return serializeAgent(updated);
     });
   }

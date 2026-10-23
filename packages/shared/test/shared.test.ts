@@ -56,6 +56,8 @@ describe('transactionFingerprint', () => {
     currency: 'USD',
     purchaseOrderId: 'po_1',
     invoiceId: 'inv_1',
+    purchaseInstructionId: 'pin_1',
+    requestLinesHash: null,
   };
 
   it('binds every field', () => {
@@ -69,6 +71,8 @@ describe('transactionFingerprint', () => {
       { agentId: 'agt_2' },
       { organizationId: 'org_2' },
       { currency: 'EUR' },
+      { purchaseInstructionId: 'pin_2' },
+      { requestLinesHash: 'ln_x' },
     ];
     for (const v of variants) expect(transactionFingerprint({ ...base, ...v })).not.toBe(fp);
     expect(transactionFingerprint({ ...base })).toBe(fp);
@@ -86,5 +90,28 @@ describe('combineOutcomes / formatCents', () => {
   it('formats integer cents', () => {
     expect(formatCents(480_000)).toBe('$4,800.00');
     expect(formatCents(5)).toBe('$0.05');
+  });
+});
+
+describe('exact quantity arithmetic', () => {
+  it('parses decimals exactly and rejects bad input', async () => {
+    const { parseQuantity, formatQuantity, exactLineTotal } = await import('@agenttrust/shared');
+    expect(parseQuantity('2')).toBe(2000n);
+    expect(parseQuantity('2.5')).toBe(2500n);
+    expect(parseQuantity('0.125')).toBe(125n);
+    expect(formatQuantity(2500n)).toBe('2.5');
+    for (const bad of ['0', '-1', '1.2345', 'abc', '1e3', '']) expect(() => parseQuantity(bad)).toThrow();
+    expect(exactLineTotal(2500n, 4_000n)).toBe(10_000n); // 2.5 × $40.00 = $100.00
+    expect(exactLineTotal(1500n, 333n)).toBeNull(); // 1.5 × $3.33 = $4.995 → not exact → rejected
+    expect(exactLineTotal(1_000_000_000_000n, 100_000_000_000n)).toBe(100_000_000_000_000_000_000n); // 1e9 units × 1e11 cents: no float overflow
+  });
+
+  it('hashes lines independent of order and sensitive to every field', async () => {
+    const { linesHash } = await import('@agenttrust/shared');
+    const a = { instructionLineNumber: 1, sku: 'A', quantityMilli: 1000, unitPriceCents: 100, lineTotalCents: 100 };
+    const b = { instructionLineNumber: 2, sku: null, quantityMilli: 2000, unitPriceCents: 50, lineTotalCents: 100 };
+    expect(linesHash([a, b])).toBe(linesHash([b, a]));
+    expect(linesHash([a, b])).not.toBe(linesHash([a, { ...b, sku: 'B' }]));
+    expect(linesHash([a])).not.toBe(linesHash([{ ...a, quantityMilli: 2000, lineTotalCents: 200 }]));
   });
 });

@@ -11,6 +11,10 @@ import { SessionsController } from './auth/sessions.controller';
 import { AuthorizationsController } from './authorizations/authorizations.controller';
 import { AuthorizationsService } from './authorizations/authorizations.service';
 import { FactsLoader } from './authorizations/facts.loader';
+import { InstructionsController } from './instructions/instructions.controller';
+import { InstructionsService } from './instructions/instructions.service';
+import { ReceiptsController } from './instructions/receipts.controller';
+import { IntegrationsController } from './integrations/integrations.controller';
 import { CryptoService } from './common/crypto.service';
 import { AllExceptionsFilter } from './common/exception.filter';
 import { PrismaService } from './common/prisma.service';
@@ -42,6 +46,9 @@ export class AppModule {
         PoliciesController,
         SuppliersController,
         ProcurementController,
+        IntegrationsController,
+        InstructionsController,
+        ReceiptsController,
         AuthorizationsController,
         TransactionsController,
         SandboxController,
@@ -61,6 +68,7 @@ export class AppModule {
         },
         SecurityMonitorService,
         FactsLoader,
+        InstructionsService,
         AuthorizationsService,
         TransactionsService,
         ReconcilerService,

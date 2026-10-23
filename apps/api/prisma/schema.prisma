@@ -109,6 +109,40 @@ enum ActorType {
   agent
   user
   system
+  integration
+}
+
+enum FulfillmentType {
+  physical_goods
+  services
+  subscription
+  digital_goods
+}
+
+enum InstructionSource {
+  human
+  erp
+}
+
+/// Only `approved` instructions can authorize payments. A successful ERP sync
+/// does NOT imply approval.
+enum InstructionStatus {
+  pending_approval
+  approved
+  rejected
+  revoked
+}
+
+enum ReceiptType {
+  goods_received
+  service_completed
+  subscription_activated
+  digital_delivered
+}
+
+enum IntegrationStatus {
+  active
+  revoked
 }
 
 model Organization {
@@ -314,8 +348,12 @@ model Invoice {
   status              InvoiceStatus @default(open)
   paidAt              DateTime?
   paidByTransactionId String?
-  createdByUserId     String
+  /// Purchase instruction this invoice bills against (optional).
+  instructionId       String?
+  createdByUserId     String?
+  createdByIntegrationId String?
   createdAt           DateTime      @default(now())
+  lines               InvoiceLine[]
 
   /// The same supplier invoice number can only exist once per organization.
   @@unique([organizationId, supplierId, invoiceNumber])
@@ -350,6 +388,12 @@ model Authorization {
   currency                      String
   purchaseOrderId               String?
   invoiceId                     String?
+  /// Purchase instruction (exact version) and the exact lines being paid.
+  instructionId                 String?
+  instructionVersion            Int?
+  /// [{ instructionLineNumber, sku, quantityMilli, unitPriceCents, lineTotalCents }]
+  lines                         Json?
+  linesHash                     String?
   // Outcome
   initialDecision               Decision
   decision                      Decision
@@ -369,6 +413,7 @@ model Authorization {
   @@index([organizationId, createdAt])
   @@index([organizationId, status])
   @@index([supplierId, status])
+  @@index([instructionId, status])
 }
 
 model Approval {
@@ -392,6 +437,10 @@ model BudgetReservation {
   delegationId    String
   purchaseOrderId String?
   invoiceId       String?
+  /// Purchase-instruction usage held by this reservation (uses, amount, per-line quantities).
+  instructionId   String?
+  /// [{ instructionLineNumber, quantityMilli }]
+  lines           Json?
   amountCents     BigInt
   currency        String
   status          ReservationStatus
@@ -402,6 +451,7 @@ model BudgetReservation {
   @@index([agentId, status, createdAt])
   @@index([purchaseOrderId, status])
   @@index([invoiceId, status])
+  @@index([instructionId, status])
 }
 
 model Transaction {
@@ -494,4 +544,134 @@ model AuditChainHead {
   organizationId String  @id
   lastSequence   Int     @default(0)
   lastEventHash  String?
+}
+
+/// Privileged machine identity for a trusted ERP integration. Narrowly scoped:
+/// instructions:sync, instructions:attest_approval, receipts:confirm, invoices:write.
+model Integration {
+  id              String            @id
+  organizationId  String
+  name            String
+  sourceSystem    String
+  scopes          String[]
+  /// SHA-256 of a 256-bit random secret (shown once at creation).
+  secretHash      String
+  status          IntegrationStatus @default(active)
+  createdByUserId String
+  createdAt       DateTime          @default(now())
+  revokedAt       DateTime?
+
+  @@unique([organizationId, sourceSystem])
+}
+
+/// An independently approved business instruction: WHAT may be bought, from
+/// WHOM, by WHICH agent, for HOW MUCH, how many times, until WHEN. Created by
+/// humans or synced from an ERP; never by agents. Material changes bump
+/// `version`, require re-approval and invalidate outstanding authorizations.
+model PurchaseInstruction {
+  id                String            @id
+  organizationId    String
+  version           Int               @default(1)
+  source            InstructionSource
+  sourceSystem      String?
+  externalId        String?
+  externalVersion   String?
+  externalUpdatedAt DateTime?
+  syncedAt          DateTime?
+  integrationId     String?
+  erpApprovalStatus String?
+  erpApprovedBy     String?
+  erpApprovedAt     DateTime?
+  agentId           String
+  supplierId        String
+  purchaseOrderId   String?
+  fulfillmentType   FulfillmentType
+  currency          String
+  maxAmountCents    BigInt
+  maxUses           Int
+  validFrom         DateTime
+  expiresAt         DateTime
+  description       String?
+  materialHash      String
+  linesHash         String
+  status            InstructionStatus
+  createdByUserId   String?
+  approvedByUserId  String?
+  approvedAt        DateTime?
+  /// agenttrust_user | erp_attested
+  approvalSource    String?
+  revokedAt         DateTime?
+  revokedBy         String?
+  revokeReason      String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  lines             PurchaseInstructionLine[]
+
+  @@unique([organizationId, sourceSystem, externalId])
+  @@index([organizationId, agentId, status])
+}
+
+model PurchaseInstructionLine {
+  id             String  @id
+  instructionId  String
+  instruction    PurchaseInstruction @relation(fields: [instructionId], references: [id], onDelete: Restrict)
+  lineNumber     Int
+  sku            String?
+  description    String
+  unit           String?
+  /// Quantity in thousandths (exact; 2.5 units = 2500).
+  quantityMilli  BigInt
+  unitPriceCents BigInt
+  lineTotalCents BigInt
+
+  @@unique([instructionId, lineNumber])
+}
+
+/// Immutable history of purchase instructions (one row per version/approval event).
+model PurchaseInstructionVersion {
+  id            String   @id
+  organizationId String
+  instructionId String
+  version       Int
+  changeType    String
+  changedBy     String
+  snapshot      Json
+  createdAt     DateTime @default(now())
+
+  @@index([instructionId, version])
+}
+
+/// Goods-received / service-completion / activation confirmation for three-way matching.
+/// Recorded only by authorized humans or trusted ERP integrations.
+model Receipt {
+  id                String      @id
+  organizationId    String
+  instructionId     String
+  type              ReceiptType
+  /// [{ instructionLineNumber, quantityMilli }]
+  lines             Json
+  confirmedByUserId String?
+  integrationId     String?
+  externalId        String?
+  note              String?
+  voidedAt          DateTime?
+  voidedByUserId    String?
+  createdAt         DateTime    @default(now())
+
+  @@index([instructionId])
+}
+
+model InvoiceLine {
+  id                    String  @id
+  invoiceId             String
+  invoice               Invoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  lineNumber            Int
+  instructionLineNumber Int?
+  sku                   String?
+  description           String
+  quantityMilli         BigInt
+  unitPriceCents        BigInt
+  lineTotalCents        BigInt
+
+  @@unique([invoiceId, lineNumber])
 }

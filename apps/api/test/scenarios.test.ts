@@ -40,10 +40,11 @@ afterAll(async () => {
 describe('AgentTrust demo scenarios', () => {
   let paidInvoiceId: string;
   let paidPoId: string;
+  let paidInstructionId: string;
 
   it('1. $500 to an approved supplier → ALLOW, and the gateway pays it', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(50_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 50_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 50_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 50_000, poId, invoiceId, instructionId });
 
     expect(auth.decision).toBe('ALLOW');
     expect(auth.reasonCodes).toEqual(expect.arrayContaining(['AGENT_ACTIVE', 'DELEGATION_VALID', 'SUPPLIER_APPROVED', 'PAYEE_VERIFIED', 'BUDGET_AVAILABLE', 'PO_MATCHED', 'INVOICE_MATCHED']));
@@ -57,13 +58,14 @@ describe('AgentTrust demo scenarios', () => {
 
     const invoice = await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`);
     expect(invoice.status).toBe('paid');
-    paidInvoiceId = invoiceId;
+    paidInvoiceId = invoiceId!;
     paidPoId = poId;
+    paidInstructionId = instructionId;
   });
 
   it('2. $5,000 against a $500 approval → DENY (amount verification)', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(50_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 500_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 50_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 500_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('DENY');
     expect(auth.reasonCodes).toEqual(expect.arrayContaining(['AMOUNT_EXCEEDS_PO', 'AMOUNT_MISMATCH_INVOICE']));
     expect(auth.token).toBeUndefined();
@@ -93,6 +95,7 @@ describe('AgentTrust demo scenarios', () => {
           organizationId: world.orgId, agentId: agent.id, action: 'purchase', supplierId: world.supplierId, paymentDestinationFingerprint: 'pd_x',
           amountCents: 50_000, currency: 'USD', purchaseOrderId: null, invoiceId: null, paymentRail: 'ach', destinationRef: 'cp_x',
           supplierVersion: 2, policyId: 'pol_x', policyVersion: 1, delegationId: 'dlg_x',
+          purchaseInstructionId: 'pin_x', requestLinesHash: null, instructionId: 'pin_x', instructionVersion: 1, linesHash: 'ln_x',
         },
         { id: 'auth_' + 'f'.repeat(32), sessionId: null, iat: now, exp: now + 600, nonce: 'forged' },
       ),
@@ -108,21 +111,21 @@ describe('AgentTrust demo scenarios', () => {
   });
 
   it('5. $500 for an invoice that was already paid → DENY (duplicate protection)', async () => {
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 50_000, poId: paidPoId, invoiceId: paidInvoiceId });
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 50_000, poId: paidPoId, invoiceId: paidInvoiceId, instructionId: paidInstructionId });
     expect(auth.decision).toBe('DENY');
     expect(auth.reasonCodes).toContain('INVOICE_ALREADY_PAID');
   });
 
   it('6. Scam invoice: approved supplier but a different bank account → DENY (payee verification)', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(50_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, payee: BANK_ATTACKER, amountCents: 50_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 50_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, payee: BANK_ATTACKER, amountCents: 50_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('DENY');
     expect(auth.reasonCodes).toContain('PAYEE_MISMATCH');
   });
 
   it('7. Editing an approved $500 authorization to $5,000 is blocked', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(50_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 50_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 50_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 50_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('ALLOW');
 
     const [h, p, s] = auth.token!.split('.');
@@ -139,8 +142,8 @@ describe('AgentTrust demo scenarios', () => {
   });
 
   it('8. Re-using a consumed authorization is blocked (single use)', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(40_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 40_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 40_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 40_000, poId, invoiceId, instructionId });
     expect((await executeFor(agent, auth)).status).toBe('succeeded');
     const replay = await apiError(executeFor(agent, auth));
     expect(replay.status).toBe(409);
@@ -149,8 +152,8 @@ describe('AgentTrust demo scenarios', () => {
   });
 
   it('9. REVIEW → human approves → payment executes', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(300_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 300_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 300_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 300_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('REVIEW');
     expect(auth.reasonCodes).toEqual(['APPROVAL_REQUIRED']);
     expect(auth.approvable).toBe(true);
@@ -170,10 +173,8 @@ describe('AgentTrust demo scenarios', () => {
 
   it('10. Concurrent purchases cannot overspend the budget', async () => {
     const tight = await world.createAgent('Procurement Agent #107', { maxTransactionCents: 50_000, monthlyLimitCents: 120_000 });
-    const orders = await Promise.all(Array.from({ length: 5 }, () => world.poAndInvoice(50_000)));
-    const results = await Promise.all(
-      orders.map(({ poId, invoiceId }) => purchase(tight, { supplierId: world.supplierId, amountCents: 50_000, poId, invoiceId })),
-    );
+    const orders = await Promise.all(Array.from({ length: 5 }, () => world.order(tight, 50_000)));
+    const results = await Promise.all(orders.map((o) => purchase(tight, { ...o, amountCents: 50_000 })));
     const allowed = results.filter((r) => r.decision === 'ALLOW');
     const denied = results.filter((r) => r.decision === 'DENY');
     expect(allowed).toHaveLength(2);
@@ -184,8 +185,8 @@ describe('AgentTrust demo scenarios', () => {
   it('11. Graded response: scam-invoice denials alert but do NOT suspend; forged/tampered tokens DO', async () => {
     const other = await createWorld(server.baseUrl, 'Globex Corp'); // default policy: 3 violations / 10 min
     const rogue = await other.createAgent('Compromised Agent #666', { maxTransactionCents: 500_000, monthlyLimitCents: 2_000_000 });
-    const { poId, invoiceId } = await other.poAndInvoice(50_000);
-    const legit = await purchase(rogue, { supplierId: other.supplierId, amountCents: 50_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await other.order(rogue, 50_000);
+    const legit = await purchase(rogue, { supplierId: other.supplierId, amountCents: 50_000, poId, invoiceId, instructionId });
     expect(legit.decision).toBe('ALLOW');
 
     // (a) An outsider can make the agent read scam invoices: these are denied and
@@ -220,8 +221,8 @@ describe('AgentTrust demo scenarios', () => {
 
   it('12. A revoked agent cannot transact (kill switch)', async () => {
     const doomed = await world.createAgent('Retired Agent #42', { maxTransactionCents: 500_000, monthlyLimitCents: 2_000_000 });
-    const { poId, invoiceId } = await world.poAndInvoice(50_000);
-    const issued = await purchase(doomed, { supplierId: world.supplierId, amountCents: 50_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(doomed, 50_000);
+    const issued = await purchase(doomed, { supplierId: world.supplierId, amountCents: 50_000, poId, invoiceId, instructionId });
     expect(issued.decision).toBe('ALLOW');
 
     await world.admin.post(`/v1/agents/${doomed.id}/revoke`, { reason: 'decommissioned' });
@@ -237,8 +238,8 @@ describe('AgentTrust demo scenarios', () => {
 
   it('13. [required] Supplier bank details change after authorization → execution blocked', async () => {
     const supplierId = await world.verifiedSupplier('Midwest Bearings', BANK_OTHER_SUPPLIER);
-    const { poId, invoiceId } = await world.poAndInvoice(50_000, supplierId);
-    const auth = await purchase(agent, { supplierId, payee: BANK_OTHER_SUPPLIER, amountCents: 50_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 50_000, { supplierId: supplierId });
+    const auth = await purchase(agent, { supplierId, payee: BANK_OTHER_SUPPLIER, amountCents: 50_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('ALLOW');
     expect(auth.supplierVersion).toBe(2);
 
@@ -258,8 +259,8 @@ describe('AgentTrust demo scenarios', () => {
   });
 
   it('14. [required] Provider succeeds but the gateway crashes → no duplicate payment on retry', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(45_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 45_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 45_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 45_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('ALLOW');
 
     await world.platform.sandboxFaults(['crash_after_processing']);
@@ -287,8 +288,8 @@ describe('AgentTrust demo scenarios', () => {
 
   it('15. [required] Human approves after the delegation was revoked → transaction denied', async () => {
     const a = await world.createAgent('Agent #108', { maxTransactionCents: 500_000, monthlyLimitCents: 2_000_000 });
-    const { poId, invoiceId } = await world.poAndInvoice(300_000);
-    const review = await purchase(a, { supplierId: world.supplierId, amountCents: 300_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(a, 300_000);
+    const review = await purchase(a, { supplierId: world.supplierId, amountCents: 300_000, poId, invoiceId, instructionId });
     expect(review.decision).toBe('REVIEW');
 
     const delegation = await prisma.delegation.findFirstOrThrow({ where: { agentId: a.id } });
@@ -308,8 +309,8 @@ describe('AgentTrust demo scenarios', () => {
       agentId: a.id, actions: ['purchase'], currency: 'USD', maxTransactionCents: 500_000, monthlyLimitCents: 2_000_000,
       expiresAt: new Date(Date.now() + 2_500).toISOString(),
     });
-    const { poId, invoiceId } = await world.poAndInvoice(300_000);
-    const review = await purchase(a, { supplierId: world.supplierId, amountCents: 300_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(a, 300_000);
+    const review = await purchase(a, { supplierId: world.supplierId, amountCents: 300_000, poId, invoiceId, instructionId });
     expect(review.decision).toBe('REVIEW');
     await new Promise((r) => setTimeout(r, 3_000));
 
@@ -320,14 +321,14 @@ describe('AgentTrust demo scenarios', () => {
   });
 
   it('16. Provider timeout after processing → outcome UNKNOWN (not failure) → reconciled, one payment', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(30_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 30_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 30_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 30_000, poId, invoiceId, instructionId });
     await world.platform.sandboxFaults(['timeout_after_processing']);
     const first = await executeFor(agent, auth);
     expect(first.status).toBe('unknown');
 
     // A new authorization for the same invoice is refused while the outcome is unknown.
-    const dup = await purchase(agent, { supplierId: world.supplierId, amountCents: 30_000, poId, invoiceId });
+    const dup = await purchase(agent, { supplierId: world.supplierId, amountCents: 30_000, poId, invoiceId, instructionId });
     expect(dup.decision).toBe('DENY');
     expect(dup.reasonCodes).toContain('INVOICE_IN_FLIGHT');
 
@@ -339,8 +340,8 @@ describe('AgentTrust demo scenarios', () => {
   });
 
   it('17. Provider timeout BEFORE processing → reconciliation finds nothing → safe resend with same key', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(31_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 31_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 31_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 31_000, poId, invoiceId, instructionId });
     await world.platform.sandboxFaults(['timeout_before_processing']);
     expect((await executeFor(agent, auth)).status).toBe('unknown');
     expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(0);
@@ -355,18 +356,18 @@ describe('AgentTrust demo scenarios', () => {
   });
 
   it('18. Provider declines → FAILED; hold released and invoice reopened', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(32_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 32_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 32_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 32_000, poId, invoiceId, instructionId });
     await world.platform.sandboxFaults(['decline']);
     expect((await executeFor(agent, auth)).status).toBe('failed');
     expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('open');
-    const retry = await purchase(agent, { supplierId: world.supplierId, amountCents: 32_000, poId, invoiceId });
+    const retry = await purchase(agent, { supplierId: world.supplierId, amountCents: 32_000, poId, invoiceId, instructionId });
     expect(retry.decision).toBe('ALLOW');
   });
 
   it('19. Policy changes after authorization → old authorization is invalid', async () => {
-    const { poId, invoiceId } = await world.poAndInvoice(33_000);
-    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 33_000, poId, invoiceId });
+    const { poId, invoiceId, instructionId } = await world.order(agent, 33_000);
+    const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 33_000, poId, invoiceId, instructionId });
     expect(auth.decision).toBe('ALLOW');
     await raiseViolationThreshold(world); // creates a new policy version
     expect((await apiError(executeFor(agent, auth))).code).toBe('AUTHORIZATION_INVALIDATED');

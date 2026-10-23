@@ -5,6 +5,7 @@ import type {
   AuthorizationResponse,
   CreateAuthorizationInput,
   ExecuteTransactionInput,
+  PurchaseInstruction,
   TransactionResponse,
 } from './types';
 
@@ -130,6 +131,12 @@ export class AgentTrust {
       this.session = null;
       return (await this.ensureSession()).id;
     },
+  };
+
+  /** Read-only view of the approved purchase instructions assigned to this agent. */
+  readonly instructions = {
+    list: () => this.request<{ instructions: PurchaseInstruction[] }>('GET', '/v1/agent/purchase-instructions'),
+    get: (id: string) => this.request<PurchaseInstruction>('GET', `/v1/agent/purchase-instructions/${encodeURIComponent(id)}`),
   };
 
   readonly authorizations = {

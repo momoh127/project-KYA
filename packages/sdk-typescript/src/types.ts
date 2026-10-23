@@ -23,6 +23,26 @@ export interface CreateAuthorizationInput {
   currency: string;
   purchaseOrderId?: string;
   invoiceId?: string;
+  /** The independently approved purchase instruction this payment fulfils (required for ALLOW). */
+  purchaseInstructionId?: string;
+  /** Which approved instruction lines are being bought; used only when the invoice has no lines. */
+  lines?: { instructionLineNumber: number; sku?: string; quantity: string; unitPriceCents: number }[];
+}
+
+export interface PurchaseInstruction {
+  id: string;
+  version: number;
+  status: 'pending_approval' | 'approved' | 'rejected' | 'revoked';
+  source: 'human' | 'erp';
+  agentId: string;
+  supplierId: string;
+  purchaseOrderId: string | null;
+  fulfillmentType: 'physical_goods' | 'services' | 'subscription' | 'digital_goods';
+  currency: string;
+  maxAmountCents: number;
+  maxUses: number;
+  expiresAt: string;
+  lines: { lineNumber: number; sku: string | null; description: string; unit: string | null; quantity: string; unitPriceCents: number; lineTotalCents: number }[];
 }
 
 export interface AuthorizationResponse {
@@ -44,6 +64,8 @@ export interface AuthorizationResponse {
   supplierId: string | null;
   purchaseOrderId: string | null;
   invoiceId: string | null;
+  purchaseInstructionId: string | null;
+  instructionVersion: number | null;
   expiresAt: string;
   createdAt: string;
   /** Present only while status === 'allowed'. Single-use, short-lived. */

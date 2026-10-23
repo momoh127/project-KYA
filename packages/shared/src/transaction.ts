@@ -61,9 +61,13 @@ export interface TransactionIntent {
   currency: string;
   purchaseOrderId: string | null;
   invoiceId: string | null;
+  /** Independently approved purchase instruction the payment claims to fulfil. */
+  purchaseInstructionId: string | null;
+  /** Hash of agent-supplied lines (null when lines come from the invoice). */
+  requestLinesHash: string | null;
 }
 
-export const TRANSACTION_FINGERPRINT_VERSION = 1;
+export const TRANSACTION_FINGERPRINT_VERSION = 2;
 
 /** Fingerprint of the agent's REQUEST (used for idempotency). */
 export function transactionFingerprint(intent: TransactionIntent): string {
@@ -78,6 +82,8 @@ export function transactionFingerprint(intent: TransactionIntent): string {
     currency: intent.currency,
     purchaseOrderId: intent.purchaseOrderId,
     invoiceId: intent.invoiceId,
+    purchaseInstructionId: intent.purchaseInstructionId,
+    requestLinesHash: intent.requestLinesHash,
   });
   return `tx_${sha256Hex(material)}`;
 }
@@ -99,9 +105,14 @@ export interface AuthorizationBinding extends TransactionIntent {
   policyVersion: number;
   /** Delegations are immutable grants (changes create a new id), so the id is the version. */
   delegationId: string;
+  /** Exact purchase-instruction version (material changes bump it). */
+  instructionId: string;
+  instructionVersion: number;
+  /** Hash of the exact approved-instruction lines being paid. */
+  linesHash: string;
 }
 
-export const AUTHORIZATION_FINGERPRINT_VERSION = 2;
+export const AUTHORIZATION_FINGERPRINT_VERSION = 3;
 
 export function authorizationFingerprint(b: AuthorizationBinding): string {
   const material = canonicalJson({
@@ -121,6 +132,9 @@ export function authorizationFingerprint(b: AuthorizationBinding): string {
     policyId: b.policyId,
     policyVersion: b.policyVersion,
     delegationId: b.delegationId,
+    instructionId: b.instructionId,
+    instructionVersion: b.instructionVersion,
+    linesHash: b.linesHash,
   });
   return `az_${sha256Hex(material)}`;
 }

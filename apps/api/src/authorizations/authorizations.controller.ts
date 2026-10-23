@@ -14,6 +14,22 @@ const CreateAuthorization = z
     currency: zCurrency,
     purchaseOrderId: zId('po').optional(),
     invoiceId: zId('inv').optional(),
+    /** The independently approved purchase instruction this payment fulfils. */
+    purchaseInstructionId: zId('pin').optional(),
+    /** Which approved instruction lines are being bought (used only if the invoice has no lines). */
+    lines: z
+      .array(
+        z
+          .object({
+            instructionLineNumber: z.number().int().min(1).max(999),
+            sku: z.string().min(1).max(100).optional(),
+            quantity: z.string().min(1).max(20),
+            unitPriceCents: z.number().int().min(0).max(100_000_000_000),
+          })
+          .strict(),
+      )
+      .max(100)
+      .optional(),
   })
   .strict();
 
@@ -41,7 +57,9 @@ export class AuthorizationsController {
   @Get(':id')
   @HumanOrAgent()
   get(@CurrentPrincipal() p: Principal, @Param('id') id: string) {
-    return p.kind === 'agent' ? this.service.getForAgent(p, id) : this.service.getForUser(p, id);
+    if (p.kind === 'agent') return this.service.getForAgent(p, id);
+    if (p.kind === 'user') return this.service.getForUser(p, id);
+    throw new Error('unreachable: route admits humans and agents only');
   }
 
   /** Human-only; agents can never reach these routes, so they cannot approve themselves. */

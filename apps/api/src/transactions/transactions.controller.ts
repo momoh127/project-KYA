@@ -41,7 +41,9 @@ export class TransactionsController {
   @Get(':id')
   @HumanOrAgent()
   get(@CurrentPrincipal() p: Principal, @Param('id') id: string) {
-    return p.kind === 'agent' ? this.service.getForAgent(p, id) : this.service.getForUser(p, id);
+    if (p.kind === 'agent') return this.service.getForAgent(p, id);
+    if (p.kind === 'user') return this.service.getForUser(p, id);
+    throw new Error('unreachable: route admits humans and agents only');
   }
 
   /** Manually reconcile a transaction with the payment provider (never re-pays without checking first). */

@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
-import type { Agent, Delegation, Invoice, Policy, PurchaseOrder, Supplier } from '@prisma/client';
-import type { PolicyFacts, PolicyRules } from '@agenttrust/policy-engine';
-import type { TransactionIntent } from '@agenttrust/shared';
+import type { Agent, Delegation, Invoice, InvoiceLine, Policy, PurchaseInstruction, PurchaseInstructionLine, PurchaseOrder, Supplier } from '@prisma/client';
+import type { PaymentLineFacts, PolicyFacts, PolicyRules } from '@agenttrust/policy-engine';
+import type { PaymentLine, TransactionIntent } from '@agenttrust/shared';
 import { cents, type Tx } from '../common/prisma.service';
 import { parseStoredRules } from '../policies/policies.controller';
 
@@ -13,13 +13,16 @@ export interface LoadedFacts {
   rules: PolicyRules | null;
   supplier: Supplier | null;
   purchaseOrder: PurchaseOrder | null;
-  invoice: Invoice | null;
+  invoice: (Invoice & { lines: InvoiceLine[] }) | null;
+  instruction: (PurchaseInstruction & { lines: PurchaseInstructionLine[] }) | null;
 }
+
+type HeldLine = { instructionLineNumber: number; quantityMilli: number };
 
 /**
  * Loads every fact the policy engine needs from trusted database records,
  * inside the caller's transaction, taking row locks in the global order
- * (Agent -> PurchaseOrder -> Invoice). Nothing here comes from agent claims
+ * (Agent -> PurchaseInstruction -> PurchaseOrder -> Invoice). Nothing here comes from agent claims
  * except the IDs it references, and every lookup is scoped to the
  * authenticated organization.
  */
@@ -28,7 +31,7 @@ export class FactsLoader {
   async load(
     tx: Tx,
     intent: TransactionIntent,
-    opts: { now: Date; excludeAuthorizationId: string | null; humanApprovalGranted: boolean },
+    opts: { now: Date; excludeAuthorizationId: string | null; humanApprovalGranted: boolean; requestLines: PaymentLine[] | null },
   ): Promise<LoadedFacts> {
     const { organizationId: orgId, agentId } = intent;
     const { now } = opts;
@@ -57,6 +60,31 @@ export class FactsLoader {
     const live = { OR: [{ status: 'consumed' as const }, { status: 'active' as const, expiresAt: { gt: now } }] };
     const notSelf = exclude ? { authorizationId: { not: exclude } } : {};
 
+    // 4b. Purchase instruction (locked: its uses/amount/line quantities are a shared ledger).
+    let instruction: LoadedFacts['instruction'] = null;
+    const instructionUsage = { uses: 0, amountCents: 0, quantityMilliByLine: {} as Record<number, number> };
+    let receipts: PolicyFacts['receipts'] = [];
+    if (intent.purchaseInstructionId) {
+      const locked = await tx.$queryRaw<{ id: string }[]>`
+        SELECT id FROM "PurchaseInstruction" WHERE id = ${intent.purchaseInstructionId} AND "organizationId" = ${orgId} FOR UPDATE`;
+      if (locked.length === 1) {
+        instruction = await tx.purchaseInstruction.findUnique({ where: { id: intent.purchaseInstructionId }, include: { lines: true } });
+        const held = await tx.budgetReservation.findMany({
+          where: { instructionId: intent.purchaseInstructionId, ...live, ...notSelf },
+          select: { amountCents: true, lines: true },
+        });
+        for (const h of held) {
+          instructionUsage.uses += 1;
+          instructionUsage.amountCents += cents(h.amountCents);
+          for (const l of (h.lines as HeldLine[] | null) ?? []) {
+            instructionUsage.quantityMilliByLine[l.instructionLineNumber] = (instructionUsage.quantityMilliByLine[l.instructionLineNumber] ?? 0) + l.quantityMilli;
+          }
+        }
+        const rows = await tx.receipt.findMany({ where: { instructionId: intent.purchaseInstructionId, voidedAt: null } });
+        receipts = rows.map((r) => ({ type: r.type, lines: r.lines as HeldLine[] }));
+      }
+    }
+
     // 5. Purchase order (locked: capacity is shared across agents).
     let purchaseOrder: PurchaseOrder | null = null;
     let poCommitted = 0;
@@ -74,13 +102,13 @@ export class FactsLoader {
     }
 
     // 6. Invoice (locked: duplicate-payment protection).
-    let invoice: Invoice | null = null;
+    let invoice: LoadedFacts['invoice'] = null;
     let invoiceInFlight = false;
     if (intent.invoiceId) {
       const locked = await tx.$queryRaw<{ id: string }[]>`
         SELECT id FROM "Invoice" WHERE id = ${intent.invoiceId} AND "organizationId" = ${orgId} FOR UPDATE`;
       if (locked.length === 1) {
-        invoice = await tx.invoice.findUnique({ where: { id: intent.invoiceId } });
+        invoice = await tx.invoice.findUnique({ where: { id: intent.invoiceId }, include: { lines: true } });
         await this.releaseExpiredHolds(tx, intent.invoiceId, now);
         const holders = await tx.budgetReservation.count({
           where: { invoiceId: intent.invoiceId, status: 'active', expiresAt: { gt: now }, ...notSelf },
@@ -114,6 +142,9 @@ export class FactsLoader {
           }
         : null,
       request: {
+        agentId: intent.agentId,
+        purchaseInstructionId: intent.purchaseInstructionId,
+        lines: opts.requestLines,
         action: intent.action,
         supplierId: intent.supplierId,
         amountCents: intent.amountCents,
@@ -148,14 +179,37 @@ export class FactsLoader {
             amountCents: cents(invoice.amountCents),
             currency: invoice.currency,
             status: invoice.status,
+            instructionId: invoice.instructionId,
+            lines: invoice.lines.map(toLineFacts),
           }
         : null,
+      instruction: instruction
+        ? {
+            id: instruction.id,
+            version: instruction.version,
+            status: instruction.status,
+            agentId: instruction.agentId,
+            supplierId: instruction.supplierId,
+            purchaseOrderId: instruction.purchaseOrderId,
+            fulfillmentType: instruction.fulfillmentType,
+            currency: instruction.currency,
+            maxAmountCents: cents(instruction.maxAmountCents),
+            maxUses: instruction.maxUses,
+            validFrom: instruction.validFrom,
+            expiresAt: instruction.expiresAt,
+            lines: instruction.lines.map((l) => ({
+              lineNumber: l.lineNumber, sku: l.sku, quantityMilli: cents(l.quantityMilli), unitPriceCents: cents(l.unitPriceCents),
+            })),
+          }
+        : null,
+      instructionUsage,
+      receipts,
       invoiceInFlight,
       budget: { spentThisPeriodCents: cents(spentAgg._sum.amountCents ?? 0n) },
       humanApprovalGranted: opts.humanApprovalGranted,
     };
 
-    return { facts, agent, delegation, policy, rules, supplier, purchaseOrder, invoice };
+    return { facts, agent, delegation, policy, rules, supplier, purchaseOrder, invoice, instruction };
   }
 
   /** Lazily expires stale holds on an invoice (caller holds the invoice lock). */
@@ -171,4 +225,14 @@ export class FactsLoader {
       data: { status: 'expired' },
     });
   }
+}
+
+function toLineFacts(l: InvoiceLine): PaymentLineFacts {
+  return {
+    instructionLineNumber: l.instructionLineNumber,
+    sku: l.sku,
+    quantityMilli: cents(l.quantityMilli),
+    unitPriceCents: cents(l.unitPriceCents),
+    lineTotalCents: cents(l.lineTotalCents),
+  };
 }

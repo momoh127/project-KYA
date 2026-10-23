@@ -16,7 +16,7 @@ import { ed25519Verify, type Signer } from '@agenttrust/identity';
  * The token binds the COMPLETE payment instruction (see AuthorizationBinding):
  * organization, agent, supplier + supplier-record version, payment rail,
  * provider destination, payee fingerprint, amount, currency, PO, invoice,
- * policy version and delegation. It is single-use (enforced in the database
+ * policy version, delegation, purchase-instruction version and exact lines. It is single-use (enforced in the database
  * by the gateway) and short-lived.
  */
 export const TOKEN_TYPE = 'agenttrust-authz+jws';
@@ -43,6 +43,10 @@ export interface AuthorizationClaims {
   cur: string;
   po: string | null;
   inv: string | null;
+  /** Purchase instruction id + exact version + hash of the exact lines being paid. */
+  ins: string;
+  iv: number;
+  lh: string;
   iat: number;
   exp: number;
   nonce: string;
@@ -77,6 +81,9 @@ export function claimsFromBinding(
     cur: b.currency,
     po: b.purchaseOrderId,
     inv: b.invoiceId,
+    ins: b.instructionId,
+    iv: b.instructionVersion,
+    lh: b.linesHash,
     iat: meta.iat,
     exp: meta.exp,
     nonce: meta.nonce,
@@ -164,6 +171,8 @@ export function tokenMismatches(claims: AuthorizationClaims, b: AuthorizationBin
   if (claims.inv !== b.invoiceId) m.push('invoiceId');
   if (claims.pol !== b.policyId || claims.pv !== b.policyVersion) m.push('policyVersion');
   if (claims.dlg !== b.delegationId) m.push('delegation');
+  if (claims.ins !== b.instructionId || claims.iv !== b.instructionVersion) m.push('instructionVersion');
+  if (claims.lh !== b.linesHash) m.push('lines');
   if (!safeEqual(claims.fp, authorizationFingerprint(b))) m.push('fingerprint');
   return m;
 }
@@ -178,6 +187,7 @@ function isClaims(c: unknown): c is AuthorizationClaims {
     o.iss === 'agenttrust' &&
     str('jti') && str('org') && str('agt') && strOrNull('sid') && str('dlg') && str('pol') && int('pv') &&
     str('fp') && strOrNull('sup') && int('sv') && str('rail') && str('dst') && str('pd') && int('amt') &&
-    str('cur') && strOrNull('po') && strOrNull('inv') && int('iat') && int('exp') && str('nonce')
+    str('cur') && strOrNull('po') && strOrNull('inv') && str('ins') && int('iv') && str('lh') &&
+    int('iat') && int('exp') && str('nonce')
   );
 }
