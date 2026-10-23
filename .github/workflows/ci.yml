@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agenttrust
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: agenttrust_test
+        ports: ["54329:5432"]
+        options: >-
+          --health-cmd "pg_isready -U agenttrust" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm setup:env
+      - run: pnpm --filter @agenttrust/api run db:migrate:test
+      - run: pnpm typecheck
+      # Security-critical tests: any failure blocks merge/release.
+      - run: pnpm test

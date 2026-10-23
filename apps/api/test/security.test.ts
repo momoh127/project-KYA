@@ -79,7 +79,7 @@ describe('agent identity', () => {
     expect(first.status).toBe(201);
     const second = await fetch(`${server.baseUrl}/v1/authorizations`, { method: 'POST', headers, body });
     expect(second.status).toBe(401);
-    expect((await second.json()).error.message).toMatch(/Replayed/);
+    expect(((await second.json()) as { error: { message: string } }).error.message).toMatch(/Replayed/);
   });
 
   it('rejects a signed request whose body was modified in transit', async () => {

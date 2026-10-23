@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "pnpm -r run build",
-    "typecheck": "tsc -p tsconfig.json && pnpm -r run build",
+    "typecheck": "tsc -p tsconfig.json && pnpm -r run build && tsc -p apps/api/tsconfig.json",
     "test": "pnpm run test:unit && pnpm run test:api",
     "test:unit": "vitest run",
     "test:api": "pnpm --filter @agenttrust/api run test",
