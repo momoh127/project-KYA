@@ -2,8 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop, 'feature/**', 'fix/**', 'chore/**', 'release/**', 'hotfix/**']
   pull_request:
+    branches: [main, develop]
 
 jobs:
   test:
@@ -31,3 +32,15 @@ jobs:
       - run: pnpm typecheck
       # Security-critical tests: any failure blocks merge/release.
       - run: pnpm test
+
+  # Releases to main must come from release/* or hotfix/* branches.
+  main-source-guard:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only release/* or hotfix/* may merge into main
+        run: |
+          case "${{ github.head_ref }}" in
+            release/*|hotfix/*) echo "ok: ${{ github.head_ref }}";;
+            *) echo "::error::main accepts merges only from release/* or hotfix/* (got ${{ github.head_ref }})"; exit 1;;
+          esac
