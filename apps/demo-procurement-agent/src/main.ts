@@ -351,19 +351,56 @@ async function main() {
   record('14. Approve after delegation revoked', 'DENIED', r14);
 
   // ---- 15 --------------------------------------------------------------------
-  header('15', 'Revoked agent (kill switch)');
-  const o15 = await order(50_000);
-  const a15 = await agent.propose({ supplierId: supplier.id, payee: realBank, amountCents: 50_000, ...o15 });
+  header('15', 'Attacker controls a VALID session: spend on things the business never approved');
+  const o15a = await order(200_000);
+  console.log(c.dim(`  (a real, approved $2,000 order exists: PO + purchase instruction for one CNC tool)`));
+  agentSays(c.red('(compromised) "Buy $1,900 of gift cards on that PO."'));
+  const t21a = await agent.client.authorizations.create({
+    idempotencyKey: `demo-${tag()}`, action: 'purchase', supplierId: supplier.id, payee: realBank, amountCents: 190_000, currency: 'USD',
+    purchaseOrderId: o15a.poId, purchaseInstructionId: o15a.instructionId,
+    lines: [{ instructionLineNumber: 1, sku: 'GIFT-CARDS', quantity: '1', unitPriceCents: 190_000 }],
+  });
+  showDecision(t21a);
+  agentSays(c.red('(compromised) "Then use another agent\'s approved instruction."'));
+  const t21b = await agent.propose({ supplierId: supplier.id, payee: realBank, amountCents: 300_000, poId: o14.poId, invoiceId: o14.invoiceId, instructionId: o14.instructionId });
+  showDecision(t21b);
+  agentSays(c.red('(compromised) "Fine, no instruction at all: just the valid PO."'));
+  const t21c = await agent.propose({ supplierId: supplier.id, payee: realBank, amountCents: 190_000, poId: o15a.poId });
+  showDecision(t21c);
+  const t21ok = [t21a, t21b, t21c].every((x) => x.decision !== 'ALLOW') && !t21c.approvable;
+  record('15. Valid session, unapproved intent', 'BLOCKED', t21ok ? 'BLOCKED' : 'ALLOWED');
+
+  // ---- 16 --------------------------------------------------------------------
+  header('16', 'Payment settles, then the bank RETURNS it');
+  const o16 = await order(60_000);
+  const a16 = await agent.propose({ supplierId: supplier.id, payee: realBank, amountCents: 60_000, ...o16 });
+  await agent.pay(a16);
+  await platform.sandboxAdvance(a16.id, 'settled');
+  await platform.sandboxAdvance(a16.id, 'returned');
+  const inv16 = await sarah.get<{ status: string }>(`/v1/invoices/${o16.invoiceId}`);
+  console.log(`  🏦 ${c.dim('provider webhooks:')} settled → ${c.red(c.bold('returned'))}; invoice is now ${c.yellow(c.bold(inv16.status))}`);
+  agentSays('The payment bounced. I\'ll just pay it again.');
+  const a16b = await agent.propose({ supplierId: supplier.id, payee: realBank, amountCents: 60_000, ...o16 });
+  showDecision(a16b);
+  console.log(c.dim('  → requires reconciliation and explicit release by an administrator, then a NEW authorization'));
+  record('16. Returned payment not auto-repaid', 'DENY', a16b.decision);
+
+  // ---- 17 --------------------------------------------------------------------
+  header('17', 'Revoked agent (kill switch)');
+  const o17 = await order(50_000);
+  const a17 = await agent.propose({ supplierId: supplier.id, payee: realBank, amountCents: 50_000, ...o17 });
   console.log(`  ${c.dim(`agent holds a valid ${usd(50_000)} authorization…`)}`);
   await sarah.post(`/v1/agents/${reg.agent.id}/revoke`, { reason: 'decommissioned' });
   console.log(`  👩‍💼 ${c.dim('Sarah:')} revokes Procurement Agent #104 (its sessions die with it)`);
-  const r15 = await blocked(agent.pay(a15));
-  record('15. Revoked agent', 'BLOCKED', r15);
+  const r17 = await blocked(agent.pay(a17));
+  record('17. Revoked agent', 'BLOCKED', r17);
 
   // ---- Evidence ----------------------------------------------------------------
   console.log(`\n${c.bold(c.cyan('━━ Evidence'))}`);
   const verify = await sarah.get<{ valid: boolean; eventsChecked: number }>('/v1/audit/verify');
   console.log(`  📜 Audit chain: ${verify.eventsChecked} signed, hash-chained events → ${verify.valid ? c.green(c.bold('VALID')) : c.red('INVALID')}`);
+  const { anchor } = await sarah.post<{ anchor: { fromSequence: number; toSequence: number; merkleRoot: string; storageUri: string } | null }>('/v1/audit/anchors', {});
+  if (anchor) console.log(`  ⚓ Anchored events ${anchor.fromSequence}–${anchor.toSequence}: Merkle root ${anchor.merkleRoot.slice(0, 16)}… → write-once storage ${c.dim(anchor.storageUri)}`);
 
   const passed = results.filter((r) => r.ok).length;
   console.log(`\n${c.bold('Summary')}`);
