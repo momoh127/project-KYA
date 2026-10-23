@@ -129,6 +129,7 @@ export class AuthorizationsService {
     }
 
     if (row.decision === 'DENY') await this.security.recordDenial(agent.organizationId, agent.agentId, row.id, row.reasonCodes);
+    await this.security.recordRiskSignals(agent.organizationId, agent.agentId, row.id, row.reasonCodes);
     return toView(row, { includeToken: true });
   }
 

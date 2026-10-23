@@ -173,6 +173,9 @@ export function evaluatePurchase(facts: PolicyFacts): PolicyResult {
   // ---- 6c. Three-way match (PO → receipt → invoice) -------------------------------
   checkReceipts(facts, paymentLines, { pass, deny, review });
 
+  // ---- 6d. Valid-session abuse (deterministic thresholds; never suspends) ----------
+  checkRisk(facts, { pass, deny, review }, money);
+
   // ---- 7. Human approval threshold ------------------------------------------------
   if (rules.reviewThresholdCents !== null && req.amountCents >= rules.reviewThresholdCents) {
     if (facts.humanApprovalGranted) pass(R.APPROVAL_GRANTED, 'A human approver approved this exact transaction.');
@@ -291,6 +294,35 @@ function checkInstruction(facts: PolicyFacts, r: Recorders, money: (c: number) =
 
   if (problems === 0) r.pass(R.INSTRUCTION_MATCHED, `Matches approved instruction v${ins.version}: agent, supplier, items, quantities, prices and remaining amount.`);
   return lines;
+}
+
+function checkRisk(facts: PolicyFacts, r: Recorders, money: (c: number) => string): void {
+  const rules = facts.policy!.rules.riskControls;
+  if (!rules.enabled) return;
+  const v = facts.velocity;
+  const req = facts.request;
+  const hits: [CheckResult['code'], string][] = [];
+  if (v.authorizationsLastHour + 1 > rules.maxAuthorizationsPerHour) {
+    hits.push([R.RISK_VELOCITY, `More than ${rules.maxAuthorizationsPerHour} purchase authorizations in the last hour.`]);
+  }
+  const d = facts.delegation;
+  if (d && (BigInt(v.spendLastHourCents) + BigInt(req.amountCents)) * 10_000n > BigInt(rules.maxSpendPerHourBps) * BigInt(d.monthlyLimitCents)) {
+    hits.push([R.RISK_BUDGET_DEPLETION, `This would spend ${money(v.spendLastHourCents + req.amountCents)} within an hour, over ${rules.maxSpendPerHourBps / 100}% of the monthly limit.`]);
+  }
+  if (req.supplierId && v.supplierPurchasesLast24h + 1 > rules.maxPurchasesPerSupplierPerDay) {
+    hits.push([R.RISK_SUPPLIER_FREQUENCY, `More than ${rules.maxPurchasesPerSupplierPerDay} purchases from this supplier in 24 hours.`]);
+  }
+  if (v.supplierPayeeChangedAt && facts.now.getTime() - v.supplierPayeeChangedAt.getTime() < rules.recentPayeeChangeHours * 3_600_000) {
+    hits.push([R.RISK_RECENT_PAYEE_CHANGE, `The supplier's bank details changed within the last ${rules.recentPayeeChangeHours} hours.`]);
+  }
+  if (hits.length === 0) {
+    r.pass(R.RISK_CHECKS_PASSED, 'Activity is within normal velocity and pattern thresholds.');
+    return;
+  }
+  for (const [code, msg] of hits) {
+    if (rules.response === 'DENY') r.deny(code, `${msg} Spending is temporarily restricted.`);
+    else r.review(code, `${msg} Human approval required.`, true);
+  }
 }
 
 const RECEIPT_TYPE_FOR = {

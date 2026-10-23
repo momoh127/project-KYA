@@ -22,7 +22,9 @@ export const SECURITY_VIOLATION_CODES = new Set([
   'TRANSACTION_MISMATCH',
 ]);
 
-export type AlertCategory = 'auth_failures' | 'fraud_signal' | 'repeated_denials' | 'reconciliation_required' | 'payment_exception' | 'provider_event_conflict';
+export type AlertCategory = 'auth_failures' | 'fraud_signal' | 'repeated_denials' | 'reconciliation_required' | 'payment_exception' | 'provider_event_conflict' | 'suspicious_activity';
+
+export const RISK_CODES = ['RISK_VELOCITY', 'RISK_BUDGET_DEPLETION', 'RISK_SUPPLIER_FREQUENCY', 'RISK_RECENT_PAYEE_CHANGE'] as const;
 
 /**
  * Graded responses to suspicious activity (replaces a blunt circuit breaker).
@@ -117,6 +119,23 @@ export class SecurityMonitorService {
         payload: { code, details },
       });
       await this.checkRepeatedDenials(organizationId, agentId);
+    });
+  }
+
+  /**
+   * Suspicious-but-authenticated activity (velocity, budget depletion, supplier
+   * frequency, recently changed payee). The decision already requires human
+   * approval or restricts spending; this raises an alert. Never suspends.
+   */
+  async recordRiskSignals(organizationId: string, agentId: string, authorizationId: string, reasonCodes: string[]): Promise<void> {
+    const hits = reasonCodes.filter((c) => (RISK_CODES as readonly string[]).includes(c));
+    if (hits.length === 0) return;
+    await this.safely(async () => {
+      const r = await this.rules(organizationId);
+      await this.raiseAlert(organizationId, agentId, 'suspicious_activity', new Date(Date.now() - r.alertWindowSeconds * 1000), {
+        severity: 'medium', authorizationId, reasonCodes: hits,
+        message: 'Unusual purchasing pattern from a valid agent session (possible stolen session operating within limits). Purchases now need human approval or are temporarily restricted. The agent was NOT suspended.',
+      });
     });
   }
 

@@ -11,7 +11,28 @@ export interface ThreeWayMatchRules {
   digitalGoods: ReceiptRequirement;
 }
 
+/**
+ * Deterministic checks for suspicious-but-authenticated activity (a stolen yet
+ * valid session spending within its limits). No AI scoring. A hit never
+ * suspends the agent: it requires human approval (REVIEW) or temporarily
+ * restricts spending (DENY) until the window passes.
+ */
+export interface RiskControlRules {
+  enabled: boolean;
+  /** Max ALLOW/REVIEW authorizations per agent per rolling hour. */
+  maxAuthorizationsPerHour: number;
+  /** Max share of the monthly delegation limit spendable in a rolling hour (basis points; 5000 = 50%). */
+  maxSpendPerHourBps: number;
+  /** Max purchases per agent from the same supplier per rolling 24 h. */
+  maxPurchasesPerSupplierPerDay: number;
+  /** Payments to a supplier whose bank details changed within this many hours are flagged. */
+  recentPayeeChangeHours: number;
+  response: 'REVIEW' | 'DENY';
+}
+
 export interface PolicyRules {
+  /** Deterministic valid-session abuse checks. */
+  riskControls: RiskControlRules;
   /**
    * What to do when a purchase does not reference an independently approved
    * purchase instruction. Never ALLOW. A REVIEW here is NOT click-approvable:
@@ -57,6 +78,14 @@ export interface SecurityResponseRules {
 }
 
 export const DEFAULT_POLICY_RULES: PolicyRules = {
+  riskControls: {
+    enabled: true,
+    maxAuthorizationsPerHour: 30,
+    maxSpendPerHourBps: 5000,
+    maxPurchasesPerSupplierPerDay: 20,
+    recentPayeeChangeHours: 72,
+    response: 'REVIEW',
+  },
   missingInstruction: 'REVIEW',
   threeWayMatch: {
     enabled: false,
@@ -105,6 +134,14 @@ export interface PolicyFacts {
   budget: { spentThisPeriodCents: number };
   /** True only when an authenticated human approver approved this exact transaction fingerprint. */
   humanApprovalGranted: boolean;
+  /** Recent activity of this agent (excluding this request), from trusted records. */
+  velocity: {
+    authorizationsLastHour: number;
+    spendLastHourCents: number;
+    supplierPurchasesLast24h: number;
+    /** When the supplier's bank details last CHANGED after onboarding (null = never). */
+    supplierPayeeChangedAt: Date | null;
+  };
 }
 
 export interface PaymentLineFacts {

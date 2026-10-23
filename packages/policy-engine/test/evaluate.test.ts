@@ -57,6 +57,7 @@ function baseline(amount = 50_000): PolicyFacts {
     invoiceInFlight: false,
     budget: { spentThisPeriodCents: 0 },
     humanApprovalGranted: false,
+    velocity: { authorizationsLastHour: 0, spendLastHourCents: 0, supplierPurchasesLast24h: 0, supplierPayeeChangedAt: null },
   };
 }
 
@@ -384,5 +385,41 @@ describe('three-way match', () => {
       expect(r.decision).toBe('DENY');
       expect(r.reasonCodes).toContain('REQUEST_INVALID');
     }
+  });
+});
+
+describe('valid-session abuse checks (deterministic)', () => {
+  it('flags velocity, budget depletion, supplier frequency and recent payee changes with an approvable REVIEW', () => {
+    const cases: [Partial<PolicyFacts['velocity']>, string][] = [
+      [{ authorizationsLastHour: 30 }, 'RISK_VELOCITY'],
+      [{ spendLastHourCents: 960_000 }, 'RISK_BUDGET_DEPLETION'], // 960k + 50k > 50% of 2M
+      [{ supplierPurchasesLast24h: 20 }, 'RISK_SUPPLIER_FREQUENCY'],
+      [{ supplierPayeeChangedAt: new Date('2026-10-21T12:00:00Z') }, 'RISK_RECENT_PAYEE_CHANGE'],
+    ];
+    for (const [v, code] of cases) {
+      const f = baseline();
+      f.velocity = { ...f.velocity, ...v };
+      const r = evaluatePurchase(f);
+      expect(r.decision).toBe('REVIEW');
+      expect(r.reasonCodes).toContain(code);
+      expect(r.approvable).toBe(true);
+      f.humanApprovalGranted = true;
+      expect(evaluatePurchase(f).decision).toBe('ALLOW');
+    }
+  });
+
+  it('can temporarily restrict (DENY) instead, and can be disabled', () => {
+    const f = baseline();
+    f.velocity.authorizationsLastHour = 99;
+    f.policy!.rules.riskControls.response = 'DENY';
+    expect(evaluatePurchase(f).decision).toBe('DENY');
+    f.policy!.rules.riskControls.enabled = false;
+    expect(evaluatePurchase(f).decision).toBe('ALLOW');
+  });
+
+  it('an old payee change (outside the window) is not flagged', () => {
+    const f = baseline();
+    f.velocity.supplierPayeeChangedAt = new Date('2026-10-01T00:00:00Z');
+    expect(evaluatePurchase(f).reasonCodes).toContain('RISK_CHECKS_PASSED');
   });
 });

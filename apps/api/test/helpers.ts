@@ -45,7 +45,7 @@ export interface Agent {
 }
 
 /** A fresh, fully isolated organization with people, a verified supplier and helpers. */
-export async function createWorld(baseUrl: string, name = 'Acme Manufacturing') {
+export async function createWorld(baseUrl: string, name = 'Acme Manufacturing', opts: { riskControls?: boolean } = {}) {
   const platform = new AgentTrustPlatform({ baseUrl, bootstrapToken: process.env.AGENTTRUST_BOOTSTRAP_TOKEN! });
   const tag = uniq();
   const created = await platform.createOrganization<{ organization: { id: string }; admin: { id: string } }>({
@@ -138,6 +138,9 @@ export async function createWorld(baseUrl: string, name = 'Acme Manufacturing') 
       return { supplierId: forSupplier, poId: po.id, invoiceId, instructionId: instruction.id, sku };
     },
   };
+  // Functional suites make many purchases per agent per hour; the dedicated
+  // risk suite keeps the (default-on) valid-session abuse checks enabled.
+  if (!opts.riskControls) await patchPolicy(world, (r) => ({ ...r, riskControls: { ...r.riskControls, enabled: false } }));
   return world;
 }
 

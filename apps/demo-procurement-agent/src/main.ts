@@ -153,7 +153,12 @@ async function main() {
     expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
   });
   console.log(`  • ${c.bold('Procurement Agent #104')} registered (workload key → mints 15-min session keys); Priya delegated $5,000/purchase, $20,000/month`);
-  console.log(c.dim('  • Policy v1: purchases ≥ $2,500 need human approval; unknown suppliers go to review; 3 forged/tampered tokens → auto-suspend'));
+  // Scenario 10 uses a deliberately tiny $1,200 budget; allow full hourly use so it isolates the concurrency control.
+  const { policies } = await sarah.get<{ policies: { id: string; status: string; rules: Record<string, any> }[] }>('/v1/policies');
+  const activePolicy = policies.find((p) => p.status === 'active')!;
+  await sarah.put(`/v1/policies/${activePolicy.id}`, { rules: { ...activePolicy.rules, riskControls: { ...activePolicy.rules.riskControls, maxSpendPerHourBps: 10_000 } } });
+  console.log(c.dim('  • Policy v2: approved purchase instruction required; invoice required; ≥ $2,500 needs a human; unknown suppliers → review;'));
+  console.log(c.dim('    3 forged/tampered tokens → auto-suspend; velocity / recent-payee-change checks → human review'));
 
   // Development: the workload key is signed locally. Production: a sidecar/KMS signer outside the LLM's reach.
   const agent = new GullibleProcurementAgent('Procurement Agent #104', new AgentTrust({ baseUrl: BASE_URL, credentialId: reg.credential.id, workloadSigner: localSigner(keys.privateKeyPem) }));

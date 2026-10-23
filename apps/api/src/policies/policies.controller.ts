@@ -31,7 +31,19 @@ const ThreeWayMatchSchema = z
   })
   .strict();
 
+const RiskControlsSchema = z
+  .object({
+    enabled: z.boolean(),
+    maxAuthorizationsPerHour: z.number().int().min(1).max(100_000),
+    maxSpendPerHourBps: z.number().int().min(1).max(10_000),
+    maxPurchasesPerSupplierPerDay: z.number().int().min(1).max(100_000),
+    recentPayeeChangeHours: z.number().int().min(0).max(24 * 90),
+    response: z.enum(['REVIEW', 'DENY']),
+  })
+  .strict();
+
 const rulesShape = {
+  riskControls: RiskControlsSchema,
   missingInstruction: z.enum(['REVIEW', 'DENY']),
   threeWayMatch: ThreeWayMatchSchema,
   missingReceipt: z.enum(['REVIEW', 'DENY']),
@@ -55,6 +67,7 @@ const StoredRulesSchema = z.object({
   missingInstruction: rulesShape.missingInstruction.default(DEFAULT_POLICY_RULES.missingInstruction),
   threeWayMatch: ThreeWayMatchSchema.default(DEFAULT_POLICY_RULES.threeWayMatch),
   missingReceipt: rulesShape.missingReceipt.default(DEFAULT_POLICY_RULES.missingReceipt),
+  riskControls: RiskControlsSchema.default(DEFAULT_POLICY_RULES.riskControls),
 });
 
 const CreatePolicy = z.object({ name: z.string().min(1).max(200), rules: PolicyRulesSchema }).strict();

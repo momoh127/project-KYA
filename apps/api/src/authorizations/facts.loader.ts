@@ -124,6 +124,30 @@ export class FactsLoader {
       where: { agentId, organizationId: orgId, createdAt: { gte: monthStart }, ...live, ...notSelf },
     });
 
+    // 8. Velocity / pattern facts for valid-session abuse checks (all under the agent lock).
+    const hourAgo = new Date(now.getTime() - 3_600_000);
+    const dayAgo = new Date(now.getTime() - 86_400_000);
+    const notSelfAuth = exclude ? { id: { not: exclude } } : {};
+    const authorizationsLastHour = await tx.authorization.count({
+      where: { agentId, organizationId: orgId, createdAt: { gte: hourAgo }, initialDecision: { in: ['ALLOW', 'REVIEW'] }, ...notSelfAuth },
+    });
+    const spendHour = await tx.budgetReservation.aggregate({
+      _sum: { amountCents: true },
+      where: { agentId, organizationId: orgId, createdAt: { gte: hourAgo }, ...live, ...notSelf },
+    });
+    const supplierPurchasesLast24h = intent.supplierId
+      ? await tx.authorization.count({
+          where: { agentId, organizationId: orgId, supplierId: intent.supplierId, createdAt: { gte: dayAgo }, initialDecision: { in: ['ALLOW', 'REVIEW'] }, ...notSelfAuth },
+        })
+      : 0;
+    const payeeChange = supplier
+      ? await tx.supplierVersion.findFirst({
+          where: { supplierId: supplier.id, changeType: 'payment_destination_changed' },
+          orderBy: { createdAt: 'desc' },
+          select: { createdAt: true },
+        })
+      : null;
+
     const facts: PolicyFacts = {
       now,
       policy: policy && rules ? { id: policy.id, version: policy.version, rules } : null,
@@ -207,6 +231,12 @@ export class FactsLoader {
       invoiceInFlight,
       budget: { spentThisPeriodCents: cents(spentAgg._sum.amountCents ?? 0n) },
       humanApprovalGranted: opts.humanApprovalGranted,
+      velocity: {
+        authorizationsLastHour,
+        spendLastHourCents: cents(spendHour._sum.amountCents ?? 0n),
+        supplierPurchasesLast24h,
+        supplierPayeeChangedAt: payeeChange?.createdAt ?? null,
+      },
     };
 
     return { facts, agent, delegation, policy, rules, supplier, purchaseOrder, invoice, instruction };
