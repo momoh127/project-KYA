@@ -80,3 +80,16 @@ See [THREAT_MODEL.md § Residual risks](THREAT_MODEL.md#residual-risks-unresolve
 ## Reporting
 
 Report suspected vulnerabilities privately to the maintainers; do not open public issues.
+
+## v0.3 invariants
+
+| Invariant | Enforcement |
+|---|---|
+| Valid credentials alone never authorize a payment | Approved, current purchase instruction required; missing → non-approvable REVIEW / DENY |
+| Agents can't create, modify, approve or reassign instructions | No agent-writable routes; agents read only their own approved instructions |
+| A sync is not an approval | `instructions:attest_approval` scope required for ERP-reported approvals |
+| Exact money and quantity arithmetic | Integer cents, integer milli-quantities, exact totals or rejection; DB CHECK constraints; no currency conversion |
+| Acceptance ≠ payment | Invoice paid only on `settled`; transition table blocks backwards moves |
+| Returned/reversed payments are not auto-repayable | `payment_exception` hold; explicit release after provider re-confirmation; new authorization required |
+| Collusion-resistant payee assurance | Provider-backed `ownership_verified` required above policy thresholds |
+| History rewrite is detectable | Merkle anchors in write-once storage + independent verifier |

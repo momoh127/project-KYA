@@ -15,6 +15,15 @@ enforcing gateway; approvals; race-free budgets; duplicate protection; signed ha
 - Graded, DoS-resistant security responses + alerts
 - 90 automated tests; 15-scenario live demo
 
+**v0.3: purchase-intent verification** ([ADR-0004](adr/0004-purchase-intent-and-finality.md)):
+- Independently approved purchase instructions (human + ERP), line-item matching, configurable three-way match (T21)
+- Payment lifecycle and finality, signed/deduplicated webhooks, returns/reversals held for explicit release (T22)
+- Deterministic valid-session abuse checks
+- Supplier assurance levels + account-verification provider interface
+- External audit anchoring (Merkle, write-once storage, independent verifier)
+- Cross-agent concurrency tests; branching workflow (main = production)
+- 153 automated tests; 17-scenario live demo
+
 ## Next
 
 | Priority | Item | Why |
@@ -22,7 +31,9 @@ enforcing gateway; approvals; race-free budgets; duplicate protection; signed ha
 | P0 | OIDC human auth with MFA and real step-up (`max_age` / `acr`) | Replace dev issuer |
 | P0 | KMS-backed platform `Signer`, key rotation | Key custody |
 | P0 | `WorkloadIdentityVerifier` (SPIFFE JWT-SVID, AWS/GCP/Azure workload identity) | Remove long-lived agent secrets |
-| P0 | Dashboard: approvals queue, alerts, suppliers (verification workflow), transactions (reconciliation), audit | Finance/compliance users |
+| P0 | Dashboard: instruction approvals, review queue, alerts, supplier verification, payment exceptions, audit/anchors | Finance/compliance users |
+| P0 | S3 Object Lock anchor adapter (separate account) | Close R3 |
+| P0 | Real account-verification provider | Close R4 |
 | P1 | **MCP server** exposing only high-level tools to models | Drop-in for agent frameworks without exposing keys |
 | P1 | Real payment adapters meeting the idempotency + status-lookup contract (Stripe incl. single-use Issuing cards, Modern Treasury) | Enforcement on real rails; closes R0 for card spend |
 | P1 | Bank-account ownership verification provider | Close R4 |

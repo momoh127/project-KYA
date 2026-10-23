@@ -92,3 +92,28 @@ if (auth.decision === 'ALLOW') {
 | `TOKEN_MALFORMED`, `TOKEN_EXPIRED`, `TOKEN_SUPERSEDED`, `AUTHORIZATION_NOT_FOUND`, `AUTHORIZATION_NOT_ALLOWED`, `AUTHORIZATION_EXPIRED`, `AUTHORIZATION_INVALIDATED`, `AUTHORIZATION_ALREADY_USED` (409), `AGENT_NOT_ACTIVE`, `DELEGATION_CHANGED`, `DELEGATION_NO_LONGER_VALID`, `POLICY_CHANGED`, `SUPPLIER_NOT_VERIFIED`, `SUPPLIER_RECORD_CHANGED`, `PAYEE_CHANGED`, `AUTHORIZATION_BINDING_CHANGED`, `INVOICE_NOT_PAYABLE` | operational (alerts only) |
 
 Decision reason codes are defined in [`packages/shared/src/decision.ts`](../packages/shared/src/decision.ts).
+
+## v0.3 endpoints
+
+| Method & path | Caller | Purpose |
+|---|---|---|
+| `POST /v1/purchase-instructions` | admin, approver, member | Request an instruction (`pending_approval`) |
+| `PUT /v1/purchase-instructions/:id` | human | Material amendment → new version, re-approval, invalidates authorizations |
+| `POST /v1/purchase-instructions/:id/approve` | admin, approver ≠ requester (fresh login, authority ≥ amount) | Independent approval |
+| `POST /v1/purchase-instructions/:id/reject` / `revoke` | admin, approver | Close; revocation invalidates authorizations |
+| `GET /v1/purchase-instructions[/:id][/versions][/receipts]` | human | Read / history |
+| `GET /v1/agent/purchase-instructions[/:id]` | agent session | Read-only: own approved instructions |
+| `POST /v1/integrations` / `GET` / `POST /:id/revoke` | admin (fresh login) | ERP integration identities + scopes (token shown once) |
+| `POST /v1/integrations/erp/purchase-instructions` | integration `instructions:sync` | Upsert by external id (stale rejected) |
+| `POST /v1/receipts` | human or integration `receipts:confirm` | Goods receipt / service completion / activation / delivery |
+| `POST /v1/receipts/:id/void` | admin | Invalidates dependent authorizations |
+| `POST /v1/invoices` | human or integration `invoices:write` | Now accepts `purchaseInstructionId` and exact `lines` |
+| `POST /v1/suppliers/:id/account-verification` | admin (step-up) | Provider-backed account/ownership verification |
+| `POST /v1/transactions/:id/resolve` | admin (fresh login) | Release a failed/returned/reversed payment after provider re-confirmation |
+| `POST /v1/webhooks/payments/:provider` | provider (HMAC signature) | Payment lifecycle events (deduplicated) |
+| `POST /v1/audit/anchors`, `GET /v1/audit/anchors`, `GET /v1/audit/export` | admin (/approver for list) | External anchoring + verifier export |
+| `POST /v1/dev/sandbox/payments/:key/advance` | platform (dev) | Simulate settle / return / reverse / fail (+ signed webhook) |
+
+`POST /v1/authorizations` accepts `purchaseInstructionId` and optional `lines`
+`[{ instructionLineNumber, sku?, quantity: "2.5", unitPriceCents }]`. Execute returns **202** while a payment is
+`requested`/`accepted`/`processing`/`unknown`. Only `settled` (200) means paid.
