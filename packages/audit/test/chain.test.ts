@@ -58,3 +58,28 @@ describe('audit hash chain', () => {
     expect(r.problems.map((p) => p.problem)).toContain('invalid signature');
   });
 });
+
+describe('Merkle anchoring', () => {
+  it('roots, inclusion proofs, and detection of changes after anchoring', async () => {
+    const { merkleRoot, inclusionProof, verifyInclusion, signAnchor, verifyAgainstAnchors } = await import('@agenttrust/audit');
+    const { events, resolveKey } = buildChain(7);
+    const hashes = events.map((e) => e.eventHash);
+    const root = merkleRoot(hashes);
+    for (let i = 0; i < hashes.length; i++) expect(verifyInclusion(hashes[i]!, inclusionProof(hashes, i), root)).toBe(true);
+    expect(verifyInclusion('f'.repeat(64), inclusionProof(hashes, 0), root)).toBe(false);
+
+    const signer = new LocalEd25519Signer('anchor_key', generateEd25519KeyPair().privateKeyPem);
+    const resolve = (kid: string) => (kid === 'anchor_key' ? signer.publicKey : null);
+    const anchor = signAnchor({
+      v: 1, organizationId: 'org_1', fromSequence: 1, toSequence: 4, eventCount: 4,
+      merkleRoot: merkleRoot(hashes.slice(0, 4)), chainHeadHash: hashes[3]!, previousMerkleRoot: null, createdAt: new Date().toISOString(),
+    }, signer);
+    const ok = verifyAgainstAnchors(events, [anchor], (kid) => resolveKey(kid) ?? resolve(kid));
+    expect(ok.problems.filter((p) => p.startsWith('anchor'))).toEqual([]);
+    expect(ok.unanchoredEvents).toBe(3);
+
+    const forged = events.map((e, i) => (i === 1 ? { ...e, eventHash: 'a'.repeat(64) } : e));
+    const bad = verifyAgainstAnchors(forged, [anchor], (kid) => resolveKey(kid) ?? resolve(kid));
+    expect(bad.problems.some((p) => p.includes('Merkle root mismatch'))).toBe(true);
+  });
+});

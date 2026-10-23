@@ -22,6 +22,7 @@ export const IdPrefix = {
   integration: 'int',
   providerEvent: 'pev',
   supplierVerification: 'svf',
+  auditAnchor: 'anc',
   delegation: 'dlg',
   policy: 'pol',
   supplier: 'sup',
