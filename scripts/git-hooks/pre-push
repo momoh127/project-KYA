@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Blocks direct pushes to main. Releases set AGENTTRUST_RELEASE=1 deliberately
+# while pushing a release/* or hotfix/* merge (see docs/BRANCHING.md).
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = "refs/heads/main" ] && [ "${AGENTTRUST_RELEASE:-}" != "1" ]; then
+    echo "✋ Direct pushes to main are blocked. Merge via release/* or hotfix/* (docs/BRANCHING.md)." >&2
+    exit 1
+  fi
+done
+exit 0
