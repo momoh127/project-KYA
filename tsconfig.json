@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@agenttrust/shared": ["packages/shared/src"],
+      "@agenttrust/policy-engine": ["packages/policy-engine/src"],
+      "@agenttrust/identity": ["packages/identity/src"],
+      "@agenttrust/authorization": ["packages/authorization/src"],
+      "@agenttrust/audit": ["packages/audit/src"],
+      "@agenttrust/sdk": ["packages/sdk-typescript/src"]
+    }
+  },
+  "include": ["packages/*/src", "packages/*/test"]
+}

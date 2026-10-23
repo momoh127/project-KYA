@@ -1,0 +1,10 @@
+Copyright (c) 2026 AgentTrust. All rights reserved.
+
+This software and its source code are proprietary and confidential.
+No license is granted to use, copy, modify, or distribute this software
+without prior written permission from the copyright holder.
+
+Third-party components are licensed under their own terms (see each
+dependency's license). Concepts informed by the Apache-2.0 licensed
+open-kya/kya-standard project were independently re-implemented; no source
+files from that project are included. See docs/THIRD_PARTY.md.

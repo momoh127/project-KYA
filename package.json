@@ -1,0 +1,30 @@
+{
+  "name": "agenttrust",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AgentTrust: the authorization layer for AI agents that spend money.",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "tsc -p tsconfig.json && pnpm -r run build",
+    "test": "pnpm run test:unit && pnpm run test:api",
+    "test:unit": "vitest run",
+    "test:api": "pnpm --filter @agenttrust/api run test",
+    "setup:env": "tsx scripts/setup-env.ts",
+    "db:start": "bash scripts/dev-db.sh start",
+    "db:stop": "bash scripts/dev-db.sh stop",
+    "db:migrate": "pnpm --filter @agenttrust/api run db:migrate",
+    "dev:api": "pnpm --filter @agenttrust/api run start",
+    "demo": "pnpm --filter @agenttrust/demo-procurement-agent run start"
+  },
+  "devDependencies": {
+    "@types/node": "^20.16.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

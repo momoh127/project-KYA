@@ -1,0 +1,108 @@
+import type { ReasonCode } from '@agenttrust/shared';
+
+export interface PolicyRules {
+  /** What to do when a purchase does not reference a purchase order. */
+  missingPurchaseOrder: 'REVIEW' | 'DENY';
+  /** What to do when a purchase does not reference an invoice. */
+  missingInvoice: 'ALLOW' | 'REVIEW' | 'DENY';
+  /** What to do when the payee is not a known supplier of this organization. */
+  unknownSupplier: 'REVIEW' | 'DENY';
+  /** Amounts at or above this threshold require human approval. null = never. */
+  reviewThresholdCents: number | null;
+  /** Lifetime of an ALLOW authorization before it must be executed. */
+  authorizationTtlSeconds: number;
+  /** Lifetime of a REVIEW authorization awaiting a human decision. */
+  reviewTtlSeconds: number;
+  /** Auto-suspend an agent after this many denials/rejections in the window. */
+  circuitBreaker: { denyThreshold: number; windowSeconds: number };
+}
+
+export const DEFAULT_POLICY_RULES: PolicyRules = {
+  missingPurchaseOrder: 'REVIEW',
+  missingInvoice: 'ALLOW',
+  unknownSupplier: 'REVIEW',
+  reviewThresholdCents: 250_000, // $2,500
+  authorizationTtlSeconds: 600, // 10 minutes
+  reviewTtlSeconds: 86_400, // 24 hours
+  circuitBreaker: { denyThreshold: 5, windowSeconds: 600 },
+};
+
+export interface PolicyFacts {
+  now: Date;
+  policy: { id: string; version: number; rules: PolicyRules } | null;
+  agent: { id: string; status: 'active' | 'suspended' | 'revoked' } | null;
+  delegation: DelegationFacts | null;
+  request: PurchaseRequestFacts;
+  /** null when the payee is not a supplier of this organization. */
+  supplier: SupplierFacts | null;
+  /** null when not referenced OR referenced but not found (see request.purchaseOrderId). */
+  purchaseOrder: PurchaseOrderFacts | null;
+  /** null when not referenced OR referenced but not found (see request.invoiceId). */
+  invoice: InvoiceFacts | null;
+  /** True when another live authorization already holds this invoice. */
+  invoiceInFlight: boolean;
+  /** Spend this calendar month under the delegation: paid + active reservations (excluding this request). */
+  budget: { spentThisPeriodCents: number };
+  /** True only when an authenticated human approver approved this exact transaction fingerprint. */
+  humanApprovalGranted: boolean;
+}
+
+export interface PurchaseRequestFacts {
+  action: string;
+  supplierId: string | null;
+  amountCents: number;
+  currency: string;
+  paymentDestinationFingerprint: string;
+  purchaseOrderId: string | null;
+  invoiceId: string | null;
+}
+
+export interface DelegationFacts {
+  id: string;
+  actions: string[];
+  maxTransactionCents: number;
+  monthlyLimitCents: number;
+  currency: string;
+  /** null = any approved supplier of the organization. */
+  approvedSupplierIds: string[] | null;
+  validFrom: Date;
+  expiresAt: Date;
+  revokedAt: Date | null;
+}
+
+export interface SupplierFacts {
+  id: string;
+  status: 'active' | 'blocked';
+  verificationStatus: 'unverified' | 'pending' | 'verified';
+  paymentDestinationFingerprint: string | null;
+}
+
+export interface PurchaseOrderFacts {
+  id: string;
+  supplierId: string;
+  approvedAmountCents: number;
+  /** Already paid + actively reserved against this PO (excluding this request). */
+  committedAmountCents: number;
+  currency: string;
+  status: 'open' | 'closed' | 'cancelled';
+}
+
+export interface InvoiceFacts {
+  id: string;
+  supplierId: string;
+  purchaseOrderId: string | null;
+  amountCents: number;
+  currency: string;
+  status: 'open' | 'paid' | 'void';
+}
+
+export interface PolicyResult {
+  decision: 'ALLOW' | 'REVIEW' | 'DENY';
+  checks: import('@agenttrust/shared').CheckResult[];
+  /** On ALLOW: all passing codes. Otherwise: only the failing/review codes. */
+  reasonCodes: ReasonCode[];
+  policyId: string | null;
+  policyVersion: number | null;
+  /** True when every remaining REVIEW check can be resolved by a human approver. */
+  approvable: boolean;
+}
