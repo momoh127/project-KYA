@@ -1,0 +1,42 @@
+{
+  "name": "@agenttrust/api",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "prisma generate && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node --env-file=../../.env --enable-source-maps dist/main.js",
+    "test": "vitest run",
+    "db:migrate": "node --env-file=../../.env node_modules/prisma/build/index.js migrate deploy",
+    "db:migrate:test": "node --env-file=../../.env -e \"process.env.DATABASE_URL=process.env.TEST_DATABASE_URL;require('child_process').execFileSync(process.execPath,['node_modules/prisma/build/index.js','migrate','deploy'],{stdio:'inherit'})\"",
+    "db:migrate:dev": "node --env-file=../../.env node_modules/prisma/build/index.js migrate dev",
+    "db:generate": "prisma generate"
+  },
+  "dependencies": {
+    "@agenttrust/audit": "workspace:*",
+    "@agenttrust/authorization": "workspace:*",
+    "@agenttrust/identity": "workspace:*",
+    "@agenttrust/policy-engine": "workspace:*",
+    "@agenttrust/shared": "workspace:*",
+    "@nestjs/common": "^10.4.15",
+    "@nestjs/core": "^10.4.15",
+    "@nestjs/platform-express": "^10.4.15",
+    "@nestjs/throttler": "^6.3.0",
+    "@prisma/client": "^5.22.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@agenttrust/sdk": "workspace:*",
+    "@swc/core": "^1.9.3",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.16.0",
+    "prisma": "^5.22.0",
+    "typescript": "^5.6.3",
+    "unplugin-swc": "^1.5.1",
+    "vitest": "^2.1.8"
+  }
+}

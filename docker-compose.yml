@@ -1,0 +1,16 @@
+# Alternative to scripts/dev-db.sh for machines with Docker.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agenttrust
+      POSTGRES_HOST_AUTH_METHOD: trust # local development only
+      POSTGRES_DB: agenttrust
+    ports:
+      - "54329:5432"
+    volumes:
+      - agenttrust-pg:/var/lib/postgresql/data
+      - ./scripts/docker-init-test-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+volumes:
+  agenttrust-pg:

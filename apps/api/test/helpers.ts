@@ -1,0 +1,170 @@
+import 'reflect-metadata';
+import type { INestApplication } from '@nestjs/common';
+import type { AddressInfo } from 'node:net';
+import { randomBytes } from 'node:crypto';
+import {
+  AgentTrust,
+  AgentTrustAdmin,
+  AgentTrustError,
+  AgentTrustPlatform,
+  generateEd25519KeyPair,
+  type AuthorizationResponse,
+  type PaymentDestination,
+} from '@agenttrust/sdk';
+import { createApp } from '../src/app';
+import { loadConfig } from '../src/config';
+
+export const BANK_GOOD: PaymentDestination = { type: 'us_ach', routingNumber: '021000021', accountNumber: '4000123456' };
+export const BANK_ATTACKER: PaymentDestination = { type: 'us_ach', routingNumber: '026009593', accountNumber: '9999000011' };
+export const BANK_OTHER_SUPPLIER: PaymentDestination = { type: 'us_ach', routingNumber: '011000015', accountNumber: '5550001111' };
+
+export interface TestServer {
+  app: INestApplication;
+  baseUrl: string;
+  close: () => Promise<void>;
+}
+
+export async function startServer(): Promise<TestServer> {
+  if (!process.env.DATABASE_URL?.includes('agenttrust_test')) {
+    throw new Error('Refusing to run integration tests against a non-test database');
+  }
+  const app = await createApp(loadConfig(process.env), { logger: false });
+  await app.listen(0, '127.0.0.1');
+  const { port } = app.getHttpServer().address() as AddressInfo;
+  return { app, baseUrl: `http://127.0.0.1:${port}`, close: () => app.close() };
+}
+
+export const uniq = () => randomBytes(4).toString('hex');
+
+export interface Agent {
+  id: string;
+  credentialId: string;
+  privateKeyPem: string;
+  client: AgentTrust;
+}
+
+/** A fresh, fully isolated organization with people, a verified supplier and helpers. */
+export async function createWorld(baseUrl: string, name = 'Acme Manufacturing') {
+  const platform = new AgentTrustPlatform({ baseUrl, bootstrapToken: process.env.AGENTTRUST_BOOTSTRAP_TOKEN! });
+  const tag = uniq();
+  const created = await platform.createOrganization<{ organization: { id: string }; admin: { id: string } }>({
+    name,
+    admin: { email: `sarah+${tag}@acme.test`, spendingAuthorityCents: 10_000_000 },
+  });
+  const orgId = created.organization.id;
+  const loginAs = async (userId: string) => new AgentTrustAdmin({ baseUrl, accessToken: (await platform.devToken(userId)).accessToken });
+
+  const admin = await loginAs(created.admin.id);
+  const admin2User = await admin.post<{ id: string }>('/v1/users', { email: `omar+${tag}@acme.test`, role: 'admin', spendingAuthorityCents: 10_000_000 });
+  const approverUser = await admin.post<{ id: string }>('/v1/users', { email: `priya+${tag}@acme.test`, role: 'approver', spendingAuthorityCents: 1_000_000 });
+  const memberUser = await admin.post<{ id: string }>('/v1/users', { email: `max+${tag}@acme.test`, role: 'member', spendingAuthorityCents: 0 });
+  const admin2 = await loginAs(admin2User.id);
+  const approver = await loginAs(approverUser.id);
+  const member = await loginAs(memberUser.id);
+
+  const supplier = await admin.post<{ id: string }>('/v1/suppliers', {
+    name: 'Precision Tools Co',
+    paymentDestination: BANK_GOOD,
+    verificationStatus: 'verified',
+  });
+
+  const world = {
+    platform,
+    orgId,
+    adminUserId: created.admin.id,
+    approverUserId: approverUser.id,
+    admin,
+    admin2,
+    approver,
+    member,
+    supplierId: supplier.id,
+
+    async createAgent(
+      agentName: string,
+      delegation: { maxTransactionCents: number; monthlyLimitCents: number; approvedSupplierIds?: string[] | null } | null,
+    ): Promise<Agent> {
+      const keys = generateEd25519KeyPair();
+      const reg = await admin.post<{ agent: { id: string }; credential: { id: string } }>('/v1/agents', {
+        name: agentName,
+        ownerUserId: created.admin.id,
+        publicKeyPem: keys.publicKeyPem,
+      });
+      if (delegation) {
+        await approver.post('/v1/delegations', {
+          agentId: reg.agent.id,
+          actions: ['purchase'],
+          currency: 'USD',
+          expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+          ...delegation,
+        });
+      }
+      return {
+        id: reg.agent.id,
+        credentialId: reg.credential.id,
+        privateKeyPem: keys.privateKeyPem,
+        client: new AgentTrust({ baseUrl, credentialId: reg.credential.id, privateKeyPem: keys.privateKeyPem }),
+      };
+    },
+
+    /** An approved PO plus a matching open invoice. */
+    async poAndInvoice(amountCents: number, supplierId = supplier.id, invoiceAmountCents = amountCents) {
+      const po = await admin.post<{ id: string }>('/v1/purchase-orders', {
+        supplierId,
+        externalReference: `PO-${uniq()}`,
+        approvedAmountCents: amountCents,
+        currency: 'USD',
+      });
+      const invoice = await admin.post<{ id: string }>('/v1/invoices', {
+        supplierId,
+        purchaseOrderId: po.id,
+        invoiceNumber: `INV-${uniq()}`,
+        amountCents: invoiceAmountCents,
+        currency: 'USD',
+      });
+      return { poId: po.id, invoiceId: invoice.id };
+    },
+  };
+  return world;
+}
+
+export type World = Awaited<ReturnType<typeof createWorld>>;
+
+export function purchase(
+  agent: Agent,
+  p: { supplierId?: string; payee?: PaymentDestination; amountCents: number; poId?: string; invoiceId?: string; key?: string },
+) {
+  return agent.client.authorizations.create({
+    idempotencyKey: p.key ?? `purchase-${uniq()}`,
+    action: 'purchase',
+    supplierId: p.supplierId,
+    payee: p.payee ?? BANK_GOOD,
+    amountCents: p.amountCents,
+    currency: 'USD',
+    purchaseOrderId: p.poId,
+    invoiceId: p.invoiceId,
+  });
+}
+
+export function executeFor(agent: Agent, auth: AuthorizationResponse, overrides: { token?: string; amountCents?: number } = {}) {
+  return agent.client.transactions.execute({
+    token: overrides.token ?? auth.token ?? '',
+    expected: {
+      supplierId: auth.supplierId,
+      amountCents: overrides.amountCents ?? auth.amountCents,
+      currency: auth.currency,
+      purchaseOrderId: auth.purchaseOrderId,
+      invoiceId: auth.invoiceId,
+    },
+  });
+}
+
+/** Resolves to the AgentTrustError thrown by `p` (fails the test if it succeeds). */
+export async function apiError(p: Promise<unknown>): Promise<AgentTrustError> {
+  try {
+    await p;
+  } catch (e) {
+    if (e instanceof AgentTrustError) return e;
+    throw e;
+  }
+  throw new Error('expected request to fail, but it succeeded');
+}

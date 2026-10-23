@@ -1,0 +1,379 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// All money columns are BigInt minor units (cents). Never floating point.
+// Every tenant-owned row carries organizationId; every query is scoped by it.
+
+enum OrgStatus {
+  active
+  suspended
+}
+
+enum VerificationStatus {
+  unverified
+  pending
+  verified
+}
+
+enum UserRole {
+  admin
+  approver
+  member
+}
+
+enum UserStatus {
+  active
+  disabled
+}
+
+enum AgentStatus {
+  active
+  suspended
+  revoked
+}
+
+enum CredentialStatus {
+  active
+  revoked
+}
+
+enum PolicyStatus {
+  active
+  superseded
+}
+
+enum SupplierStatus {
+  active
+  blocked
+}
+
+enum PoStatus {
+  open
+  closed
+  cancelled
+}
+
+enum InvoiceStatus {
+  open
+  paid
+  void
+}
+
+enum Decision {
+  ALLOW
+  REVIEW
+  DENY
+}
+
+enum AuthorizationStatus {
+  allowed
+  pending_review
+  denied
+  rejected
+  consumed
+  expired
+}
+
+enum ApprovalDecision {
+  approved
+  rejected
+}
+
+enum ReservationStatus {
+  active
+  consumed
+  released
+}
+
+enum TransactionStatus {
+  pending
+  succeeded
+  failed
+}
+
+enum ActorType {
+  agent
+  user
+  system
+}
+
+model Organization {
+  id                 String             @id
+  name               String
+  status             OrgStatus          @default(active)
+  verificationStatus VerificationStatus @default(unverified)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+}
+
+model User {
+  id                     String     @id
+  organizationId         String
+  /// Subject from the identity provider (OIDC `sub`). Never user-supplied at login.
+  externalIdentityId     String     @unique
+  email                  String
+  role                   UserRole
+  status                 UserStatus @default(active)
+  /// Max per-transaction authority this person holds and may delegate / approve.
+  spendingAuthorityCents BigInt     @default(0)
+  createdAt              DateTime   @default(now())
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+}
+
+model Agent {
+  id             String      @id
+  organizationId String
+  ownerUserId    String
+  name           String
+  description    String?
+  status         AgentStatus @default(active)
+  statusReason   String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@index([organizationId])
+}
+
+/// Public keys only. Agent private keys never reach the server.
+model AgentCredential {
+  id             String           @id
+  agentId        String
+  organizationId String
+  publicKeyPem   String
+  status         CredentialStatus @default(active)
+  createdAt      DateTime         @default(now())
+  expiresAt      DateTime?
+  revokedAt      DateTime?
+
+  @@index([agentId])
+}
+
+/// Replay protection for signed agent requests.
+model AgentRequestNonce {
+  credentialId String
+  nonce        String
+  createdAt    DateTime @default(now())
+
+  @@id([credentialId, nonce])
+  @@index([createdAt])
+}
+
+model Delegation {
+  id                  String    @id
+  organizationId      String
+  agentId             String
+  grantedByUserId     String
+  actions             String[]
+  maxTransactionCents BigInt
+  monthlyLimitCents   BigInt
+  currency            String
+  /// When false, any approved supplier of the organization is allowed.
+  restrictSuppliers   Boolean   @default(false)
+  approvedSupplierIds String[]
+  validFrom           DateTime
+  expiresAt           DateTime
+  revokedAt           DateTime?
+  revokedByUserId     String?
+  createdAt           DateTime  @default(now())
+
+  @@index([organizationId, agentId, createdAt])
+}
+
+/// Policies are immutable versions; an update creates a new version.
+model Policy {
+  id              String       @id
+  organizationId  String
+  name            String
+  version         Int
+  rules           Json
+  status          PolicyStatus
+  createdByUserId String?
+  createdAt       DateTime     @default(now())
+
+  @@unique([organizationId, version])
+  @@index([organizationId, status])
+}
+
+model Supplier {
+  id                                String             @id
+  organizationId                    String
+  name                              String
+  externalReference                 String?
+  verificationStatus                VerificationStatus
+  /// HMAC fingerprint of the verified bank details. Raw account numbers are not stored.
+  paymentDestinationFingerprint     String?
+  paymentDestinationType            String?
+  paymentDestinationLast4           String?
+  /// Counterparty id at the payment provider; the gateway pays this, never agent-supplied details.
+  paymentCounterpartyRef            String?
+  paymentDestinationChangedByUserId String?
+  paymentDestinationChangedAt       DateTime?
+  verifiedByUserId                  String?
+  verifiedAt                        DateTime?
+  status                            SupplierStatus     @default(active)
+  createdAt                         DateTime           @default(now())
+  updatedAt                         DateTime           @updatedAt
+
+  @@index([organizationId])
+}
+
+model PurchaseOrder {
+  id                  String   @id
+  organizationId      String
+  supplierId          String
+  externalReference   String
+  approvedAmountCents BigInt
+  currency            String
+  status              PoStatus @default(open)
+  approvedByUserId    String
+  createdAt           DateTime @default(now())
+
+  @@unique([organizationId, externalReference])
+  @@index([organizationId, supplierId])
+}
+
+model Invoice {
+  id                  String        @id
+  organizationId      String
+  supplierId          String
+  purchaseOrderId     String?
+  invoiceNumber       String
+  amountCents         BigInt
+  currency            String
+  documentHash        String?
+  status              InvoiceStatus @default(open)
+  paidAt              DateTime?
+  paidByTransactionId String?
+  createdByUserId     String
+  createdAt           DateTime      @default(now())
+
+  /// The same supplier invoice number can only exist once per organization.
+  @@unique([organizationId, supplierId, invoiceNumber])
+  @@index([organizationId])
+}
+
+model Authorization {
+  id                            String              @id
+  organizationId                String
+  agentId                       String
+  credentialId                  String
+  delegationId                  String?
+  policyId                      String?
+  policyVersion                 Int?
+  idempotencyKey                String
+  transactionFingerprint        String
+  // Snapshot of the exact transaction intent (immutable once created).
+  action                        String
+  supplierId                    String?
+  paymentDestinationFingerprint String
+  amountCents                   BigInt
+  currency                      String
+  purchaseOrderId               String?
+  invoiceId                     String?
+  // Outcome
+  initialDecision               Decision
+  decision                      Decision
+  status                        AuthorizationStatus
+  reasonCodes                   String[]
+  checks                        Json
+  approvable                    Boolean             @default(false)
+  token                         String?
+  tokenNonce                    String?
+  expiresAt                     DateTime
+  consumedAt                    DateTime?
+  createdAt                     DateTime            @default(now())
+  updatedAt                     DateTime            @updatedAt
+
+  @@unique([agentId, idempotencyKey])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, status])
+}
+
+model Approval {
+  id                     String           @id
+  organizationId         String
+  authorizationId        String           @unique
+  approverUserId         String
+  decision               ApprovalDecision
+  transactionFingerprint String
+  policyVersion          Int?
+  comment                String?
+  createdAt              DateTime         @default(now())
+}
+
+/// Holds budget / PO capacity / invoice while an authorization is live.
+model BudgetReservation {
+  id              String            @id
+  organizationId  String
+  authorizationId String            @unique
+  agentId         String
+  delegationId    String
+  purchaseOrderId String?
+  invoiceId       String?
+  amountCents     BigInt
+  currency        String
+  status          ReservationStatus
+  expiresAt       DateTime
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([agentId, status, createdAt])
+  @@index([purchaseOrderId, status])
+  @@index([invoiceId, status])
+}
+
+model Transaction {
+  id                String            @id
+  organizationId    String
+  /// Unique: an authorization can be executed at most once.
+  authorizationId   String            @unique
+  agentId           String
+  supplierId        String?
+  invoiceId         String?
+  amountCents       BigInt
+  currency          String
+  status            TransactionStatus
+  provider          String
+  providerReference String?
+  failureReason     String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  @@index([organizationId, createdAt])
+}
+
+/// Append-only (enforced by a database trigger, see migration).
+model AuditEvent {
+  id                String    @id
+  organizationId    String
+  sequence          Int
+  actorType         ActorType
+  actorId           String
+  eventType         String
+  subjectId         String?
+  payload           Json
+  payloadHash       String
+  previousEventHash String?
+  eventHash         String
+  signature         String
+  keyId             String
+  createdAt         DateTime
+
+  @@unique([organizationId, sequence])
+  @@index([organizationId, eventType, createdAt])
+  @@index([organizationId, actorId, createdAt])
+}
+
+model AuditChainHead {
+  organizationId String  @id
+  lastSequence   Int     @default(0)
+  lastEventHash  String?
+}
