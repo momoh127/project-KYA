@@ -14,6 +14,7 @@
     "test": "pnpm run test:unit && pnpm run test:api",
     "test:unit": "vitest run",
     "test:api": "pnpm --filter @agenttrust/api run test",
+    "test:python": "bash scripts/test-python-sdk.sh",
     "setup:env": "tsx scripts/setup-env.ts",
     "db:start": "bash scripts/dev-db.sh start",
     "db:stop": "bash scripts/dev-db.sh stop",

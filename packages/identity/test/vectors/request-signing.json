@@ -1,0 +1,58 @@
+{
+  "description": "AGENTTRUST-ED25519-V1 request-signing vectors. Generated from the TypeScript reference implementation; every SDK must reproduce them byte for byte. TEST KEY ONLY.",
+  "privateKeyPem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIIbWXWGnDPBt59Bv4SS1oLBbztaJGrSYhc0j38rLFc4B\n-----END PRIVATE KEY-----\n",
+  "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAgOJwl6G1i/QiTx5R0qkKy/Cq7E9ByaBlp0/shTJ9YLg=\n-----END PUBLIC KEY-----\n",
+  "vectors": [
+    {
+      "name": "post-json-utf8",
+      "method": "POST",
+      "path": "/v1/authorizations",
+      "body": "{\"idempotencyKey\":\"buy-0001\",\"amountCents\":48000,\"note\":\"Café ✓\"}",
+      "timestamp": 1792670400,
+      "nonce": "00112233445566778899aabbccddeeff",
+      "credentialId": "ags_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bodySha256": "d5aa5afb96352003168c7dbd16fa0da431988cf57172220a1fb449a99370d2b9",
+      "stringToSign": "AGENTTRUST-ED25519-V1\nPOST\n/v1/authorizations\n1792670400\n00112233445566778899aabbccddeeff\nd5aa5afb96352003168c7dbd16fa0da431988cf57172220a1fb449a99370d2b9",
+      "headers": {
+        "x-agenttrust-credential": "ags_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "x-agenttrust-timestamp": "1792670400",
+        "x-agenttrust-nonce": "00112233445566778899aabbccddeeff",
+        "x-agenttrust-signature": "CNx8x73u6P0OQ4IGwRrEWPS5G0FxV4RKgWGYq_ISBTvFoE-bxxdnmauo6IfN66AneR4I4JgP8lrQj5gWozjnDA"
+      }
+    },
+    {
+      "name": "get-empty-body",
+      "method": "GET",
+      "path": "/v1/agent/purchase-instructions",
+      "body": "",
+      "timestamp": 1792670401,
+      "nonce": "ffeeddccbbaa99887766554433221100",
+      "credentialId": "ags_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bodySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stringToSign": "AGENTTRUST-ED25519-V1\nGET\n/v1/agent/purchase-instructions\n1792670401\nffeeddccbbaa99887766554433221100\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "headers": {
+        "x-agenttrust-credential": "ags_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "x-agenttrust-timestamp": "1792670401",
+        "x-agenttrust-nonce": "ffeeddccbbaa99887766554433221100",
+        "x-agenttrust-signature": "VmP5et1YdojIwERfT9M7YZFUM9DumFGlSoJPtwOWHG8496CAGSIjnYZI76VVnDs1O8vbdpHcmC0XavbPf1MYAA"
+      }
+    },
+    {
+      "name": "get-with-query",
+      "method": "get",
+      "path": "/v1/authorizations?status=pending_review",
+      "body": "",
+      "timestamp": 1792670402,
+      "nonce": "abcdefABCDEF0123456789_-abcdefgh",
+      "credentialId": "ags_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bodySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stringToSign": "AGENTTRUST-ED25519-V1\nGET\n/v1/authorizations?status=pending_review\n1792670402\nabcdefABCDEF0123456789_-abcdefgh\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "headers": {
+        "x-agenttrust-credential": "ags_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "x-agenttrust-timestamp": "1792670402",
+        "x-agenttrust-nonce": "abcdefABCDEF0123456789_-abcdefgh",
+        "x-agenttrust-signature": "2QQLeqw3tjb8keovCQ91w-14JAcyyiZQV2coIQsP0YIX_sO4d9uqFXFX-O2s3KNzyuAm254YLzBWFfDg5SqXCg"
+      }
+    }
+  ]
+}
