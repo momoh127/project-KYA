@@ -24,6 +24,7 @@ import { OrganizationsController } from './organizations/organizations.controlle
 import { PoliciesController } from './policies/policies.controller';
 import { ProcurementController } from './procurement/procurement.controller';
 import { SecurityMonitorService } from './security/security-monitor.service';
+import { ACCOUNT_VERIFICATION_PROVIDER, SandboxAccountVerificationProvider } from './suppliers/account-verification';
 import { SuppliersController } from './suppliers/suppliers.controller';
 import { PAYMENT_ADAPTER, SandboxPaymentAdapter } from './transactions/payment-adapter';
 import { ReconcilerService } from './transactions/reconciler.service';
@@ -77,6 +78,8 @@ export class AppModule {
         ReconcilerService,
         // Production: replace with a real provider adapter (Stripe, Modern Treasury, bank API).
         { provide: PAYMENT_ADAPTER, useClass: SandboxPaymentAdapter },
+        // Production: a real account/ownership verification provider.
+        { provide: ACCOUNT_VERIFICATION_PROVIDER, useClass: SandboxAccountVerificationProvider },
         { provide: APP_GUARD, useClass: ThrottlerGuard },
         { provide: APP_GUARD, useClass: AuthGuard },
         { provide: APP_FILTER, useClass: AllExceptionsFilter },

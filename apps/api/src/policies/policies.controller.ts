@@ -42,7 +42,17 @@ const RiskControlsSchema = z
   })
   .strict();
 
+const AssuranceLevelSchema = z.enum(['recorded', 'reviewed', 'account_verified', 'ownership_verified']);
+const SupplierAssuranceSchema = z
+  .object({
+    minimum: AssuranceLevelSchema,
+    byAmount: z.array(z.object({ minAmountCents: z.number().int().min(1), level: AssuranceLevelSchema }).strict()).max(10),
+    insufficient: z.enum(['REVIEW', 'DENY']),
+  })
+  .strict();
+
 const rulesShape = {
+  supplierAssurance: SupplierAssuranceSchema,
   riskControls: RiskControlsSchema,
   missingInstruction: z.enum(['REVIEW', 'DENY']),
   threeWayMatch: ThreeWayMatchSchema,
@@ -68,6 +78,7 @@ const StoredRulesSchema = z.object({
   threeWayMatch: ThreeWayMatchSchema.default(DEFAULT_POLICY_RULES.threeWayMatch),
   missingReceipt: rulesShape.missingReceipt.default(DEFAULT_POLICY_RULES.missingReceipt),
   riskControls: RiskControlsSchema.default(DEFAULT_POLICY_RULES.riskControls),
+  supplierAssurance: SupplierAssuranceSchema.default(DEFAULT_POLICY_RULES.supplierAssurance),
 });
 
 const CreatePolicy = z.object({ name: z.string().min(1).max(200), rules: PolicyRulesSchema }).strict();

@@ -1,5 +1,7 @@
-import { Body, Controller, Get, Param, Patch, Post } from '@nestjs/common';
-import type { Prisma, Supplier } from '@prisma/client';
+import { Body, Controller, Get, Inject, Param, Patch, Post } from '@nestjs/common';
+import type { Prisma, Supplier, SupplierAssurance } from '@prisma/client';
+import { SecurityMonitorService } from '../security/security-monitor.service';
+import { ACCOUNT_VERIFICATION_PROVIDER, type AccountVerificationProvider } from './account-verification';
 import { z } from 'zod';
 import { IdPrefix, newId } from '@agenttrust/shared';
 import { CurrentUser, FreshAuth, Human, type HumanPrincipal } from '../auth/principal';
@@ -10,12 +12,16 @@ import { Errors } from '../common/errors';
 import { PrismaService, type Tx } from '../common/prisma.service';
 import { zPaymentDestination, ZodPipe } from '../common/validation';
 
+const ASSURANCE: SupplierAssurance[] = ['recorded', 'reviewed', 'account_verified', 'ownership_verified'];
+
 /** Bank-detail changes require a login within this many seconds (step-up authentication). */
 export const STEP_UP_MAX_AGE_SECONDS = 300;
 
 const CreateSupplier = z
   .object({
     name: z.string().min(1).max(200),
+    /** Registered legal entity name, used for account-ownership verification. */
+    legalName: z.string().min(1).max(300).optional(),
     externalReference: z.string().max(200).optional(),
     paymentDestination: zPaymentDestination.optional(),
   })
@@ -24,8 +30,16 @@ const CreateSupplier = z
 const UpdateSupplier = z
   .object({
     name: z.string().min(1).max(200).optional(),
+    legalName: z.string().min(1).max(300).optional(),
     status: z.enum(['active', 'blocked']).optional(),
     paymentDestination: zPaymentDestination.optional(),
+  })
+  .strict();
+
+const AccountVerification = z
+  .object({
+    /** The raw bank details, re-entered by the admin; must match the stored fingerprint exactly. */
+    paymentDestination: zPaymentDestination,
   })
   .strict();
 
@@ -63,6 +77,8 @@ export class SuppliersController {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly crypto: CryptoService,
+    private readonly security: SecurityMonitorService,
+    @Inject(ACCOUNT_VERIFICATION_PROVIDER) private readonly accounts: AccountVerificationProvider,
   ) {}
 
   @Post()
@@ -78,8 +94,10 @@ export class SuppliersController {
           id,
           organizationId: admin.organizationId,
           name: body.name,
+          legalName: body.legalName,
           externalReference: body.externalReference,
           verificationStatus: pd ? 'pending' : 'unverified',
+          assuranceLevel: 'recorded',
           paymentDestinationFingerprint: pd?.fingerprint,
           paymentDestinationType: pd?.type,
           paymentDestinationLast4: pd?.last4,
@@ -136,6 +154,12 @@ export class SuppliersController {
       let changeType = 'updated';
 
       if (body.name !== undefined && body.name !== s.name) { data.name = body.name; changes.name = body.name; }
+      if (body.legalName !== undefined && body.legalName !== s.legalName) {
+        // The legal entity is what ownership was verified against: changing it voids provider-backed assurance.
+        data.legalName = body.legalName;
+        changes.legalName = body.legalName;
+        if (s.assuranceLevel === 'ownership_verified') { data.assuranceLevel = 'account_verified'; changes.assuranceLevel = 'account_verified'; }
+      }
       if (body.status !== undefined && body.status !== s.status) { data.status = body.status; changes.status = body.status; changeType = `status_${body.status}`; }
       if (body.paymentDestination) {
         const pd = this.crypto.payeeFingerprint(body.paymentDestination);
@@ -152,7 +176,9 @@ export class SuppliersController {
             verifiedByUserId: null,
             verifiedAt: null,
             verificationEvidence: null,
+            assuranceLevel: 'recorded',
           } satisfies Prisma.SupplierUpdateInput);
+          changes.assuranceLevel = 'recorded';
           changes.paymentDestinationLast4 = pd.last4;
           changes.previousPaymentDestinationLast4 = s.paymentDestinationLast4;
           changes.verificationStatus = 'pending';
@@ -198,7 +224,11 @@ export class SuppliersController {
       const version = s.version + 1;
       const updated = await tx.supplier.update({
         where: { id },
-        data: { verificationStatus: 'verified', verifiedByUserId: admin.userId, verifiedAt: new Date(), verificationEvidence: body.evidence, version },
+        data: {
+          verificationStatus: 'verified', verifiedByUserId: admin.userId, verifiedAt: new Date(), verificationEvidence: body.evidence, version,
+          // Second-person review. Provider-backed levels (if already reached) are kept.
+          assuranceLevel: s.assuranceLevel === 'recorded' ? 'reviewed' : s.assuranceLevel,
+        },
       });
       await this.snapshot(tx, updated, 'payment_destination_verified', admin.userId);
       await invalidateLiveAuthorizations(tx, this.audit, {
@@ -217,6 +247,67 @@ export class SuppliersController {
       });
       return serializeSupplier(updated);
     });
+  }
+
+  /**
+   * Independent, provider-backed verification of the account and of who owns
+   * it. This is the control against collusion: two internal approvers cannot
+   * make an attacker's account belong to the supplier. A mismatch is an alert
+   * (possible business email compromise) and never raises assurance.
+   */
+  @Post(':id/account-verification')
+  @Human('admin')
+  @FreshAuth(STEP_UP_MAX_AGE_SECONDS)
+  async verifyAccount(@CurrentUser() admin: HumanPrincipal, @Param('id') id: string, @Body(new ZodPipe(AccountVerification)) body: z.infer<typeof AccountVerification>) {
+    const current = await this.find(this.prisma, admin, id);
+    if (!current.paymentDestinationFingerprint) throw Errors.invalid('Supplier has no payment destination');
+    const pd = this.crypto.payeeFingerprint(body.paymentDestination);
+    if (pd.fingerprint !== current.paymentDestinationFingerprint) {
+      throw Errors.invalid('These bank details do not match the destination on record');
+    }
+    const result = await this.accounts.verify({ destination: body.paymentDestination, legalName: current.legalName });
+    // A positive ownership MISMATCH never raises assurance, even if the account exists:
+    // an existing account held by someone else is exactly the fraud we are guarding against.
+    const level: SupplierAssurance =
+      result.accountStatus !== 'valid' || result.ownerNameMatch === 'no_match' ? current.assuranceLevel
+        : result.ownerNameMatch === 'match' ? 'ownership_verified'
+          : 'account_verified';
+    const raises = ASSURANCE.indexOf(level) > ASSURANCE.indexOf(current.assuranceLevel);
+    const suspicious = result.accountStatus === 'invalid' || result.ownerNameMatch === 'no_match';
+
+    const out = await this.prisma.tx(async (tx) => {
+      const s = await this.lockSupplier(tx, admin, id);
+      if (s.paymentDestinationFingerprint !== current.paymentDestinationFingerprint) throw Errors.conflict('CHANGED', 'Supplier changed during verification; retry');
+      await tx.supplierVerification.create({
+        data: {
+          id: newId(IdPrefix.supplierVerification), organizationId: admin.organizationId, supplierId: id, supplierVersion: s.version,
+          provider: this.accounts.name, accountStatus: result.accountStatus, ownerNameMatch: result.ownerNameMatch,
+          resultLevel: level, providerReference: result.providerReference, requestedByUserId: admin.userId,
+        },
+      });
+      let updated = s;
+      if (raises) {
+        const version = s.version + 1;
+        updated = await tx.supplier.update({ where: { id }, data: { assuranceLevel: level, version } });
+        await this.snapshot(tx, updated, `assurance_${level}`, admin.userId);
+        await invalidateLiveAuthorizations(tx, this.audit, {
+          organizationId: admin.organizationId, where: { supplierId: id },
+          reason: `supplier record changed (v${version}: assurance ${level})`, actor: { type: 'user', id: admin.userId },
+        });
+      }
+      await this.audit.append(tx, {
+        organizationId: admin.organizationId, actorType: 'user', actorId: admin.userId, eventType: 'supplier.account_verification', subjectId: id,
+        payload: { provider: this.accounts.name, accountStatus: result.accountStatus, ownerNameMatch: result.ownerNameMatch, assuranceLevel: updated.assuranceLevel, providerReference: result.providerReference },
+      });
+      return updated;
+    });
+    if (suspicious) {
+      await this.security.raiseAlert(admin.organizationId, id, 'fraud_signal', new Date(Date.now() - 3_600_000), {
+        severity: 'high', supplierId: id, accountStatus: result.accountStatus, ownerNameMatch: result.ownerNameMatch,
+        message: 'Account verification failed: the account does not exist or is NOT held by this supplier. Possible business email compromise or insider fraud.',
+      });
+    }
+    return { supplier: serializeSupplier(out), verification: { ...result, provider: this.accounts.name, resultingAssurance: out.assuranceLevel } };
   }
 
   private requireStepUp(admin: HumanPrincipal): void {
@@ -257,6 +348,8 @@ export class SuppliersController {
           paymentCounterpartyRef: s.paymentCounterpartyRef,
           verifiedByUserId: s.verifiedByUserId,
           verificationEvidence: s.verificationEvidence,
+          assuranceLevel: s.assuranceLevel,
+          legalName: s.legalName,
         },
       },
     });
@@ -275,7 +368,10 @@ export function serializeSupplier(s: Supplier) {
     name: s.name,
     externalReference: s.externalReference,
     version: s.version,
+    legalName: s.legalName,
     verificationStatus: s.verificationStatus,
+    /** recorded → reviewed → account_verified → ownership_verified */
+    assuranceLevel: s.assuranceLevel,
     status: s.status,
     paymentDestination: s.paymentDestinationLast4 ? { type: s.paymentDestinationType, last4: s.paymentDestinationLast4 } : null,
     verifiedAt: s.verifiedAt?.toISOString() ?? null,

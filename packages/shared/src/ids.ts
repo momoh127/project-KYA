@@ -21,6 +21,7 @@ export const IdPrefix = {
   invoiceLine: 'inl',
   integration: 'int',
   providerEvent: 'pev',
+  supplierVerification: 'svf',
   delegation: 'dlg',
   policy: 'pol',
   supplier: 'sup',

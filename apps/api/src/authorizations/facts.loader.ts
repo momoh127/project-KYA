@@ -182,6 +182,7 @@ export class FactsLoader {
             id: supplier.id,
             status: supplier.status,
             verificationStatus: supplier.verificationStatus,
+            assuranceLevel: supplier.assuranceLevel,
             paymentDestinationFingerprint: supplier.paymentDestinationFingerprint,
           }
         : null,

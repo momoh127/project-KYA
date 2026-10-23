@@ -7,7 +7,7 @@ import {
   safeEqual,
   type CheckResult,
 } from '@agenttrust/shared';
-import type { PaymentLineFacts, PolicyFacts, PolicyResult } from './types';
+import { ASSURANCE_ORDER, type PaymentLineFacts, type PolicyFacts, type PolicyResult } from './types';
 
 /**
  * Deterministic purchase authorization.
@@ -82,6 +82,17 @@ export function evaluatePurchase(facts: PolicyFacts): PolicyResult {
       review(R.SUPPLIER_UNVERIFIED, `Supplier verification is "${s.verificationStatus}".`, false);
     } else {
       pass(R.SUPPLIER_APPROVED, 'Supplier is approved and verified.');
+    }
+
+    // Required assurance level of the payment destination (amount-dependent).
+    const sa = rules.supplierAssurance;
+    const required = sa.byAmount
+      .filter((t) => req.amountCents >= t.minAmountCents)
+      .reduce((lvl, t) => (ASSURANCE_ORDER.indexOf(t.level) > ASSURANCE_ORDER.indexOf(lvl) ? t.level : lvl), sa.minimum);
+    if (s.status !== 'blocked' && ASSURANCE_ORDER.indexOf(s.assuranceLevel) < ASSURANCE_ORDER.indexOf(required)) {
+      const msg = `Payee assurance is "${s.assuranceLevel}"; this payment requires "${required}".`;
+      if (sa.insufficient === 'DENY') deny(R.SUPPLIER_ASSURANCE_INSUFFICIENT, msg);
+      else review(R.SUPPLIER_ASSURANCE_INSUFFICIENT, `${msg} Complete supplier verification, then resubmit.`, false);
     }
 
     if (d?.approvedSupplierIds && !d.approvedSupplierIds.includes(s.id)) {

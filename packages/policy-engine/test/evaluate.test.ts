@@ -34,7 +34,7 @@ function baseline(amount = 50_000): PolicyFacts {
       purchaseOrderId: 'po_200',
       invoiceId: 'inv_900',
     },
-    supplier: { id: 'sup_100', status: 'active', verificationStatus: 'verified', paymentDestinationFingerprint: PD_GOOD },
+    supplier: { id: 'sup_100', status: 'active', verificationStatus: 'verified', assuranceLevel: 'reviewed', paymentDestinationFingerprint: PD_GOOD },
     purchaseOrder: { id: 'po_200', supplierId: 'sup_100', approvedAmountCents: amount, committedAmountCents: 0, currency: 'USD', status: 'open' },
     invoice: { id: 'inv_900', supplierId: 'sup_100', purchaseOrderId: 'po_200', amountCents: amount, currency: 'USD', status: 'open', instructionId: 'pin_1', lines: [line] },
     instruction: {
@@ -421,5 +421,27 @@ describe('valid-session abuse checks (deterministic)', () => {
     const f = baseline();
     f.velocity.supplierPayeeChangedAt = new Date('2026-10-01T00:00:00Z');
     expect(evaluatePurchase(f).reasonCodes).toContain('RISK_CHECKS_PASSED');
+  });
+});
+
+describe('supplier assurance levels', () => {
+  it('requires the configured level, stricter for larger amounts; insufficient → non-approvable REVIEW or DENY', () => {
+    const f = baseline(300_000);
+    f.policy!.rules.supplierAssurance.byAmount = [{ minAmountCents: 100_000, level: 'ownership_verified' }];
+    const r = evaluatePurchase(f);
+    expect(r.reasonCodes).toContain('SUPPLIER_ASSURANCE_INSUFFICIENT');
+    expect(r.approvable).toBe(false);
+    f.supplier!.assuranceLevel = 'ownership_verified';
+    f.humanApprovalGranted = true;
+    expect(evaluatePurchase(f).decision).toBe('ALLOW');
+
+    const small = baseline(50_000);
+    small.policy!.rules.supplierAssurance.byAmount = [{ minAmountCents: 100_000, level: 'ownership_verified' }];
+    expect(evaluatePurchase(small).decision).toBe('ALLOW');
+
+    const recorded = baseline();
+    recorded.supplier!.assuranceLevel = 'recorded';
+    recorded.policy!.rules.supplierAssurance.insufficient = 'DENY';
+    expect(evaluatePurchase(recorded).decision).toBe('DENY');
   });
 });

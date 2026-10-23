@@ -30,7 +30,21 @@ export interface RiskControlRules {
   response: 'REVIEW' | 'DENY';
 }
 
+export type AssuranceLevel = 'recorded' | 'reviewed' | 'account_verified' | 'ownership_verified';
+export const ASSURANCE_ORDER: AssuranceLevel[] = ['recorded', 'reviewed', 'account_verified', 'ownership_verified'];
+
+export interface SupplierAssuranceRules {
+  /** Minimum payee assurance for any payment. */
+  minimum: AssuranceLevel;
+  /** Stricter levels for larger payments (highest matching threshold applies). */
+  byAmount: { minAmountCents: number; level: AssuranceLevel }[];
+  /** What to do when assurance is insufficient. REVIEW here is not click-approvable. */
+  insufficient: 'REVIEW' | 'DENY';
+}
+
 export interface PolicyRules {
+  /** Required assurance of the supplier's payment destination. */
+  supplierAssurance: SupplierAssuranceRules;
   /** Deterministic valid-session abuse checks. */
   riskControls: RiskControlRules;
   /**
@@ -78,6 +92,7 @@ export interface SecurityResponseRules {
 }
 
 export const DEFAULT_POLICY_RULES: PolicyRules = {
+  supplierAssurance: { minimum: 'reviewed', byAmount: [], insufficient: 'REVIEW' },
   riskControls: {
     enabled: true,
     maxAuthorizationsPerHour: 30,
@@ -199,6 +214,7 @@ export interface SupplierFacts {
   id: string;
   status: 'active' | 'blocked';
   verificationStatus: 'unverified' | 'pending' | 'verified';
+  assuranceLevel: AssuranceLevel;
   paymentDestinationFingerprint: string | null;
 }
 

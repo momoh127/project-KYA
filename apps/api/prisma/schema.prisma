@@ -151,6 +151,18 @@ enum ReceiptType {
   digital_delivered
 }
 
+/// Distinct assurance levels for a supplier's payment destination (ordered).
+///  recorded           bank details entered (by one person)
+///  reviewed           a second person reviewed them with out-of-band evidence
+///  account_verified   an account-verification provider confirmed the account exists and is open
+///  ownership_verified the provider confirmed the account holder matches the supplier's legal entity
+enum SupplierAssurance {
+  recorded
+  reviewed
+  account_verified
+  ownership_verified
+}
+
 enum IntegrationStatus {
   active
   revoked
@@ -309,6 +321,9 @@ model Supplier {
   verifiedAt                        DateTime?
   /// How the payment destination was confirmed to belong to this supplier (e.g. callback to a known number).
   verificationEvidence              String?
+  /// Registered legal name, used for account-ownership matching.
+  legalName                         String?
+  assuranceLevel                    SupplierAssurance  @default(recorded)
   /// Incremented on every change; authorizations bind to the version they were issued against.
   version                           Int                @default(1)
   status                            SupplierStatus     @default(active)
@@ -711,4 +726,23 @@ model ProviderEvent {
 
   @@unique([provider, eventId])
   @@index([idempotencyKey])
+}
+
+/// Results of independent account / ownership verification (provider-backed).
+model SupplierVerification {
+  id                String            @id
+  organizationId    String
+  supplierId        String
+  supplierVersion   Int
+  provider          String
+  /// valid | invalid | unknown
+  accountStatus     String
+  /// match | partial | no_match | unavailable
+  ownerNameMatch    String
+  resultLevel       SupplierAssurance
+  providerReference String?
+  requestedByUserId String
+  createdAt         DateTime          @default(now())
+
+  @@index([supplierId])
 }
