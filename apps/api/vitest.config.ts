@@ -33,7 +33,7 @@ export default defineConfig(() => {
     },
     test: {
       include: ['test/**/*.test.ts'],
-      env: { ...env, DATABASE_URL: env.TEST_DATABASE_URL ?? '', AGENTTRUST_RECONCILE_INTERVAL_MS: '0' },
+      env: { ...env, DATABASE_URL: env.TEST_DATABASE_URL ?? '', AGENTTRUST_RECONCILE_INTERVAL_MS: '0', AGENTTRUST_ANCHOR_INTERVAL_MS: '0', AGENTTRUST_ANCHOR_DIR: path.join(root, '.local', 'anchors-test') },
       testTimeout: 30_000,
       hookTimeout: 60_000,
       fileParallelism: false,

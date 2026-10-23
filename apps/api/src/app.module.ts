@@ -3,7 +3,9 @@ import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { AgentsController } from './agents/agents.controller';
 import { AuditController } from './audit/audit.controller';
+import { AnchorService } from './audit/anchor.service';
 import { AuditService } from './audit/audit.service';
+import { IMMUTABLE_STORAGE, LocalWriteOnceStorage } from './audit/immutable-storage';
 import { AuthGuard } from './auth/auth.guard';
 import { DevAuthController } from './auth/dev-auth.controller';
 import { DevTokenService, HUMAN_TOKEN_VERIFIER, RejectAllHumanTokens } from './auth/human-token';
@@ -62,6 +64,9 @@ export class AppModule {
         PrismaService,
         CryptoService,
         AuditService,
+        // Production: S3 Object Lock (compliance mode) adapter in a separate account.
+        { provide: IMMUTABLE_STORAGE, inject: [APP_CONFIG], useFactory: (c: AppConfig) => new LocalWriteOnceStorage(c.anchorDir) },
+        AnchorService,
         DevTokenService,
         {
           provide: HUMAN_TOKEN_VERIFIER,

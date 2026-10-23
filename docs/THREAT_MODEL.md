@@ -1,4 +1,4 @@
-# Threat Model (MVP v0.2)
+# Threat Model (MVP v0.3)
 
 Method: assets → actors → attacks → mitigations → residual risk. Every mitigation marked "Tested" has an automated
 test in `apps/api/test/` or `packages/*/test/`.
@@ -51,6 +51,14 @@ holds any *other* payment credential or tool is outside this model (see R0).
 | T18 | Cross-tenant access / field smuggling | Org from credentials; 404 for foreign ids; strict schemas | Tested |
 | T19 | Rewriting audit history | Hash chain + platform signature + DB trigger blocks UPDATE/DELETE | Tested (partial; see R3) |
 | T20 | LLM decides a financial outcome | Engine is deterministic code | By construction |
+| **T21** | **Unauthorized purchase using valid credentials and approved suppliers** (stolen valid session buys something the business never requested, e.g. an unrelated amount on a valid PO) | Payment must match an independently approved, currently valid **purchase instruction** (assigned agent, supplier, PO, currency, items, unit prices, remaining quantities/uses/amount, expiry) created by humans or ERP and never by agents; trusted invoice lines take precedence; optional three-way match; authorization binds instruction version + exact lines; gateway re-verifies | Tested (adversarial suite) |
+| T21a | Use another agent's instruction / substitute line items / reuse a single-use instruction / pay after approval revoked | Agent assignment check; line item, price, quantity and total matching; uses ledger under instruction row lock; revocation and amendment invalidate authorizations | Tested |
+| T21b | ERP sync used to smuggle approval | Sync never implies approval without `instructions:attest_approval`; stale syncs rejected; material change → new version + re-approval; integrations narrowly scoped and revocable | Tested |
+| **T22** | **Incorrect payment finality or reconciliation state** (treating acceptance as payment, double payment on retry, late/duplicate/out-of-order provider events, re-paying a returned payment) | Lifecycle states with a transition table (no backwards moves); only `settled` pays; signed, deduplicated webhooks; reconciliation polling and before-retry status queries with the same idempotency key; returned/reversed/failed-after-acceptance → `payment_exception`, capacity kept consumed, explicit admin release after provider re-confirmation, then a NEW authorization | Tested (fault injection) |
+| T23 | Two colluding or compromised admins approve a fraudulent bank change | Assurance levels; provider-backed `ownership_verified` required above a policy threshold; ownership mismatch never raises assurance + fraud alert | Tested |
+| T24 | Stolen valid session spending within limits | Deterministic velocity, budget-depletion, supplier-frequency and recent-payee-change checks → human review / temporary restriction + alert (never suspension) | Tested |
+| T25 | Insider with DB superuser AND platform key rewrites audit history | Signed Merkle anchors in write-once storage outside the DB; independent verifier reads anchors from storage | Tested (rewrite detected) |
+| T26 | Concurrent agents overspend a shared PO | Row lock on the shared PurchaseOrder (not just per-agent locks) | Tested (fails without the lock) |
 
 ## Residual risks (unresolved, documented)
 
@@ -59,10 +67,13 @@ holds any *other* payment credential or tool is outside this model (see R0).
 | R0 | **Out-of-band payment paths:** if a customer gives an agent another card/bank/API credential, AgentTrust can't prevent its use | Deployment guidance; future single-use virtual-card adapter so the only usable instrument is AgentTrust-issued |
 | R1 | Platform signing key and pepper are environment variables in dev | KMS/HSM-backed `Signer`; secret manager; key rotation by `kid` |
 | R2 | Human auth is a dev HMAC issuer; step-up uses token `auth_time` | OIDC provider with MFA and real step-up (`max_age`/`acr`) |
-| R3 | DB superuser can disable triggers and rewrite a chain (with key access) | Anchor chain heads to S3 Object Lock / external timestamping |
-| R4 | Bank-account **ownership** is verified by a human with recorded evidence, not by a bank-data provider | Integrate account-ownership verification (Nacha-style validation, Trustpair/Eftsure-like providers) |
+| R3 | Anchors use a local write-once directory; a root user on that host could still alter them | Implement the S3 Object Lock (compliance mode) adapter in a separate account/role; optionally RFC 3161 timestamping |
+| R4 | Account/ownership verification uses a **sandbox** provider | Integrate a real provider behind `AccountVerificationProvider` |
 | R5 | Workload credential is still a registered key; custody depends on the integrator using a sidecar/KMS `SignFn` | `WorkloadIdentityVerifier` for SPIFFE JWT-SVID / cloud workload-identity OIDC so no long-lived agent secret exists |
-| R6 | A compromised runtime can misuse its *current* session within policy limits for ≤ 15 min | Inherent: policy limits, budgets and payee checks bound the damage; shorter TTLs for high-risk agents |
+| R6 | A compromised runtime can still execute payments that DO match valid approved instructions assigned to it (e.g. pay a legitimate invoice early) | Inherent to delegation; bounded by instruction scope, three-way match and risk checks; shorter session TTLs for high-risk agents |
+| R11 | Purchase-instruction correctness depends on the approver / ERP data quality | Separation of duties (requester ≠ approver, authority checks); ERP attestation is opt-in; receipts by humans/ERP |
+| R12 | Threshold-based risk checks can be evaded by staying under thresholds | Deterministic by design; combine with instruction scope; tune per organization |
+| R13 | ERP integrations authenticate with a static secret | OAuth client credentials or mTLS; secret rotation |
 | R7 | No Postgres row-level security (isolation enforced in app code) | RLS policies keyed by `organizationId` |
 | R8 | Sandbox provider only; real adapters must meet the idempotency + status-lookup contract | Stripe / Modern Treasury adapters + contract tests |
 | R9 | Rate limiting is per-process memory; `SecuritySignal` / nonce tables grow | Redis limits; TTL cleanup jobs |

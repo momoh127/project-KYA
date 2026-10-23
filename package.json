@@ -1,7 +1,7 @@
 {
   "name": "agenttrust",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "AgentTrust: the authorization layer for AI agents that spend money.",
   "license": "UNLICENSED",
   "packageManager": "pnpm@9.15.4",
@@ -19,7 +19,8 @@
     "db:stop": "bash scripts/dev-db.sh stop",
     "db:migrate": "pnpm --filter @agenttrust/api run db:migrate",
     "dev:api": "pnpm --filter @agenttrust/api run start",
-    "demo": "pnpm --filter @agenttrust/demo-procurement-agent run start"
+    "demo": "pnpm --filter @agenttrust/demo-procurement-agent run start",
+    "hooks:install": "git config core.hooksPath scripts/git-hooks"
   },
   "devDependencies": {
     "@types/node": "^20.16.0",

@@ -117,3 +117,30 @@ rejects with a specific reason if anything differs.
 5. Fail closed everywhere. Monitoring failures never change an authorization outcome.
 
 See [ADR-0003](adr/0003-hardening.md) for the hardening decisions.
+
+## v0.3: purchase-intent verification
+
+```mermaid
+flowchart LR
+    U["Requester (human)"] -->|create| PI["Purchase instruction v1<br/>agent, supplier, PO, lines, uses, expiry"]
+    ERP["ERP integration<br/>scope instructions:sync"] -->|sync (never implies approval)| PI
+    A2["Approver (≠ requester, authority ≥ amount)"] -->|approve| PI
+    R["Receiving clerk / ERP"] -->|receipt / completion| RC["Receipts"]
+    AP["AP / ERP"] -->|invoice + lines| INV["Invoice"]
+    AG["Agent (valid session)"] -->|reference ids only| ENG["Policy engine"]
+    PI --> ENG
+    RC --> ENG
+    INV --> ENG
+    ENG -->|ALLOW| TOK["Token binds instruction v + lines hash"]
+```
+
+- **Instruction ledger:** uses, amount and per-line quantities are tracked through budget reservations. Requests lock the
+  instruction row, so concurrent requests can't over-consume it.
+- **Lines precedence:** trusted invoice lines are used when present. Agent-supplied lines are used only otherwise, and a
+  conflict is a DENY.
+- **Finality:** see the payment lifecycle in [ADR-0004](adr/0004-purchase-intent-and-finality.md). Only `settled`
+  marks an invoice paid.
+- **Lock order:** `Authorization → Agent → PurchaseInstruction → PurchaseOrder → Invoice → AuditChainHead`. Change paths
+  (supplier, instruction, delegation, policy, agent) lock live authorization rows first and write audit last.
+- **Anchoring:** `AnchorService` writes signed Merkle roots to `ImmutableStorage`. `agenttrust-verify` checks an export
+  against anchors read directly from storage.

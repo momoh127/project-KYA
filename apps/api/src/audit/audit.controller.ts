@@ -1,7 +1,8 @@
-import { Controller, Get, Param, Query } from '@nestjs/common';
+import { Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { z } from 'zod';
 import { CurrentUser, Human, type HumanPrincipal } from '../auth/principal';
 import { ZodPipe } from '../common/validation';
+import { AnchorService } from './anchor.service';
 import { AuditService } from './audit.service';
 
 const ListQuery = z
@@ -15,7 +16,30 @@ const ListQuery = z
 
 @Controller('v1/audit')
 export class AuditController {
-  constructor(private readonly audit: AuditService) {}
+  constructor(
+    private readonly audit: AuditService,
+    private readonly anchors: AnchorService,
+  ) {}
+
+  /** Anchor all not-yet-anchored events now (also runs on a background schedule). */
+  @Post('anchors')
+  @Human('admin')
+  async anchor(@CurrentUser() user: HumanPrincipal) {
+    return { anchor: await this.anchors.anchor(user.organizationId) };
+  }
+
+  @Get('anchors')
+  @Human('admin', 'approver')
+  listAnchors(@CurrentUser() user: HumanPrincipal) {
+    return this.anchors.list(user.organizationId);
+  }
+
+  /** Export for the independent verifier (events + public keys). */
+  @Get('export')
+  @Human('admin')
+  export(@CurrentUser() user: HumanPrincipal) {
+    return this.anchors.export(user.organizationId);
+  }
 
   @Get('events')
   @Human('admin', 'approver')

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { z } from 'zod';
 
 const EnvSchema = z.object({
@@ -12,6 +13,10 @@ const EnvSchema = z.object({
   AGENTTRUST_DEV_AUTH_SECRET: z.string().min(32).optional(),
   /** HMAC secret for sandbox payment-provider webhooks (>= 32 chars). Without it, webhooks are refused. */
   AGENTTRUST_SANDBOX_WEBHOOK_SECRET: z.string().min(32).optional(),
+  /** Directory for the local write-once anchor storage (dev/test stand-in for S3 Object Lock). */
+  AGENTTRUST_ANCHOR_DIR: z.string().min(1).optional(),
+  /** Background audit anchoring interval. 0 disables. */
+  AGENTTRUST_ANCHOR_INTERVAL_MS: z.coerce.number().int().min(0).default(300_000),
   /** Background reconciliation interval for unknown payment outcomes. 0 disables. */
   AGENTTRUST_RECONCILE_INTERVAL_MS: z.coerce.number().int().min(0).default(30_000),
 });
@@ -27,6 +32,8 @@ export interface AppConfig {
   devAuth: { enabled: boolean; secret: string | null };
   reconcileIntervalMs: number;
   sandboxWebhookSecret: string | null;
+  anchorDir: string;
+  anchorIntervalMs: number;
 }
 
 export const APP_CONFIG = Symbol('APP_CONFIG');
@@ -57,5 +64,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     devAuth: { enabled: devEnabled, secret: e.AGENTTRUST_DEV_AUTH_SECRET ?? null },
     reconcileIntervalMs: e.AGENTTRUST_RECONCILE_INTERVAL_MS,
     sandboxWebhookSecret: e.AGENTTRUST_SANDBOX_WEBHOOK_SECRET ?? null,
+    anchorDir: e.AGENTTRUST_ANCHOR_DIR ?? path.resolve(process.cwd(), '.local', 'anchors'),
+    anchorIntervalMs: e.AGENTTRUST_ANCHOR_INTERVAL_MS,
   };
 }

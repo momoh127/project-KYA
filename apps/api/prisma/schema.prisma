@@ -746,3 +746,23 @@ model SupplierVerification {
 
   @@index([supplierId])
 }
+
+/// Signed Merkle-root anchors of audit batches. The authoritative copy lives in
+/// write-once storage OUTSIDE the database; this row is an index of it.
+model AuditAnchor {
+  id                 String   @id
+  organizationId     String
+  fromSequence       Int
+  toSequence         Int
+  eventCount         Int
+  merkleRoot         String
+  chainHeadHash      String
+  previousMerkleRoot String?
+  statement          Json
+  signature          String
+  keyId              String
+  storageUri         String
+  createdAt          DateTime @default(now())
+
+  @@unique([organizationId, toSequence])
+}
