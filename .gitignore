@@ -11,3 +11,4 @@ coverage/
 .local/
 *.pem
 *.key
+dist-sdk/
