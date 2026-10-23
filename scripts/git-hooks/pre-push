@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Blocks direct pushes to main. Releases set AGENTTRUST_RELEASE=1 deliberately
-# while pushing a release/* or hotfix/* merge (see docs/BRANCHING.md).
+# Local guard (not a substitute for server-side rulesets; see docs/BRANCHING.md).
+# Blocks direct pushes to main and develop. Changes reach them through pull
+# requests. Deliberate escape hatches, for when a PR cannot be used:
+#   AGENTTRUST_RELEASE=1    push a release/* or hotfix/* merge to main
+#   AGENTTRUST_INTEGRATE=1  push a reviewed --no-ff merge to develop
 while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$remote_ref" = "refs/heads/main" ] && [ "${AGENTTRUST_RELEASE:-}" != "1" ]; then
-    echo "✋ Direct pushes to main are blocked. Merge via release/* or hotfix/* (docs/BRANCHING.md)." >&2
+    echo "✋ Direct pushes to main are blocked. Open a PR from release/* or hotfix/* (docs/BRANCHING.md)." >&2
+    exit 1
+  fi
+  if [ "$remote_ref" = "refs/heads/develop" ] && [ "${AGENTTRUST_INTEGRATE:-}" != "1" ]; then
+    echo "✋ Direct pushes to develop are blocked. Open a PR from feature/*, fix/* or chore/* (docs/BRANCHING.md)." >&2
     exit 1
   fi
 done
