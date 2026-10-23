@@ -185,7 +185,7 @@ export interface InvoiceFacts {
   /** Trusted lines recorded by humans/ERP (may be empty for legacy invoices). */
   lines: PaymentLineFacts[];
   /** `processing` = a payment for it is executing or being reconciled. */
-  status: 'open' | 'processing' | 'paid' | 'void';
+  status: 'open' | 'processing' | 'paid' | 'void' | 'payment_exception';
 }
 
 export interface PolicyResult {

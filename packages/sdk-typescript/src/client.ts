@@ -214,6 +214,14 @@ export class AgentTrustPlatform {
     return this.post<{ queued: string[] }>('/v1/dev/sandbox/faults', { faults });
   }
 
+  /** Development only: move a sandbox payment along the provider lifecycle (optionally delivering a signed webhook). */
+  sandboxAdvance(idempotencyKey: string, status: 'accepted' | 'processing' | 'settled' | 'failed' | 'returned' | 'reversed', opts: { deliverWebhook?: boolean; duplicateDelivery?: boolean } = {}) {
+    return this.post<{ providerStatus: string; deliveries: { outcome: string; duplicate: boolean; transactionStatus?: string }[] }>(
+      `/v1/dev/sandbox/payments/${encodeURIComponent(idempotencyKey)}/advance`,
+      { status, deliverWebhook: opts.deliverWebhook ?? true, duplicateDelivery: opts.duplicateDelivery ?? false },
+    );
+  }
+
   /** Development only: the sandbox provider's own ledger for an idempotency key. */
   async sandboxLedger(idempotencyKey: string) {
     return send<{ payments: { idempotencyKey: string; status: string; amountCents: number; providerReference: string }[] }>(

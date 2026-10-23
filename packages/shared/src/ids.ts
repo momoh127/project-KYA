@@ -20,6 +20,7 @@ export const IdPrefix = {
   receipt: 'rcp',
   invoiceLine: 'inl',
   integration: 'int',
+  providerEvent: 'pev',
   delegation: 'dlg',
   policy: 'pol',
   supplier: 'sup',

@@ -1,8 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { newId } from '@agenttrust/shared';
 import { PrismaService } from '../common/prisma.service';
+import type { ObservedStatus } from './lifecycle';
 
 export interface PaymentRequest {
   /** Stable per transaction; the provider MUST deduplicate on it. */
@@ -15,29 +16,30 @@ export interface PaymentRequest {
 }
 
 /**
- * `unknown` means the outcome could not be determined (timeout, connection
- * reset). It is NEVER treated as failure: the payment may have gone through.
+ * Result of submitting a payment. `accepted` means the provider took the
+ * request, NOT that money settled. `unknown` means the outcome could not be
+ * determined (timeout, connection reset) and is never treated as failure.
  */
 export interface PaymentResult {
-  status: 'succeeded' | 'failed' | 'unknown';
+  status: 'accepted' | 'failed' | 'unknown';
   providerReference: string | null;
   detail?: string;
 }
 
 export interface PaymentStatus {
-  status: 'succeeded' | 'failed' | 'pending' | 'not_found';
+  status: ObservedStatus | 'not_found';
   providerReference: string | null;
 }
 
 /**
- * Boundary to real money movement. Implementations hold the payment-provider
- * credentials, which exist only inside the gateway and are never exposed to
- * agents or API responses.
+ * Boundary to real money movement. Implementations hold the provider
+ * credentials, which exist only inside the gateway.
  *
- * Requirements for any real adapter (Stripe, Modern Treasury, bank APIs):
- *  - `execute` must be idempotent on `idempotencyKey` at the PROVIDER;
- *  - `getStatus` must look up a payment by that key, so the gateway can
- *    reconcile before ever retrying.
+ * Contract for any real adapter (Stripe, Modern Treasury, bank APIs):
+ *  - `execute` is idempotent on `idempotencyKey` at the PROVIDER;
+ *  - `getStatus` looks a payment up by that key and maps the provider's own
+ *    lifecycle onto accepted / processing / settled / failed / returned / reversed;
+ *  - the provider's webhooks are verified and deduplicated by PaymentEventsService.
  */
 export interface PaymentAdapter {
   readonly name: string;
@@ -59,23 +61,22 @@ export class SimulatedProcessCrash extends Error {
 }
 
 export const SANDBOX_FAULTS = [
-  /** Provider declines the payment (definitive failure). */
   'decline',
-  /** Provider times out BEFORE processing: no payment exists. */
   'timeout_before_processing',
-  /** Provider processes the payment, then the response times out. */
   'timeout_after_processing',
-  /** Provider processes the payment, then the gateway process crashes. */
   'crash_after_processing',
-  /** Status lookups fail (provider status API unavailable). */
   'status_unavailable',
 ] as const;
 export type SandboxFault = (typeof SANDBOX_FAULTS)[number];
 
+export const SANDBOX_LIFECYCLE: ObservedStatus[] = ['accepted', 'processing', 'settled', 'failed', 'returned', 'reversed'];
+
 /**
- * Simulated payment provider. Moves no money. Its ledger is persisted in its
- * own table (as an external provider's would be), so it survives gateway
- * crashes, and it deduplicates on the idempotency key like real providers.
+ * Simulated payment provider (moves no money). Its ledger is persisted in its
+ * own table, as an external provider's would be, so it survives gateway
+ * crashes. Like real ACH providers it ACCEPTS first; settlement, failure,
+ * returns and reversals happen later (driven via `advance`, observed through
+ * signed webhooks or status queries).
  */
 @Injectable()
 export class SandboxPaymentAdapter implements PaymentAdapter {
@@ -86,14 +87,14 @@ export class SandboxPaymentAdapter implements PaymentAdapter {
   async execute(req: PaymentRequest): Promise<PaymentResult> {
     const existing = await this.prisma.sandboxProviderPayment.findUnique({ where: { idempotencyKey: req.idempotencyKey } });
     if (existing) {
-      // Provider-level idempotency: a repeated request returns the original result.
-      return { status: existing.status as 'succeeded' | 'failed', providerReference: existing.providerReference, detail: 'idempotent replay at provider' };
+      // Provider-level idempotency: a repeated request returns the original submission, never a new payment.
+      return { status: existing.status === 'failed' ? 'failed' : 'accepted', providerReference: existing.providerReference, detail: 'idempotent replay at provider' };
     }
 
     const fault = await this.takeFault(['decline', 'timeout_before_processing', 'timeout_after_processing', 'crash_after_processing']);
     if (fault === 'timeout_before_processing') return { status: 'unknown', providerReference: null, detail: 'provider timeout' };
 
-    const status = fault === 'decline' ? 'failed' : 'succeeded';
+    const status = fault === 'decline' ? 'failed' : 'accepted';
     const providerReference = `sbx_pay_${randomBytes(8).toString('hex')}`;
     try {
       await this.prisma.sandboxProviderPayment.create({
@@ -102,7 +103,7 @@ export class SandboxPaymentAdapter implements PaymentAdapter {
     } catch (e) {
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
         const raced = await this.prisma.sandboxProviderPayment.findUniqueOrThrow({ where: { idempotencyKey: req.idempotencyKey } });
-        return { status: raced.status as 'succeeded' | 'failed', providerReference: raced.providerReference, detail: 'idempotent replay at provider' };
+        return { status: raced.status === 'failed' ? 'failed' : 'accepted', providerReference: raced.providerReference, detail: 'idempotent replay at provider' };
       }
       throw e;
     }
@@ -111,17 +112,33 @@ export class SandboxPaymentAdapter implements PaymentAdapter {
     if (fault === 'crash_after_processing') throw new SimulatedProcessCrash();
     return status === 'failed'
       ? { status: 'failed', providerReference, detail: 'declined by provider' }
-      : { status: 'succeeded', providerReference };
+      : { status: 'accepted', providerReference };
   }
 
   async getStatus(idempotencyKey: string): Promise<PaymentStatus> {
     if (await this.takeFault(['status_unavailable'])) throw new Error('provider status API unavailable');
     const p = await this.prisma.sandboxProviderPayment.findUnique({ where: { idempotencyKey } });
     if (!p) return { status: 'not_found', providerReference: null };
-    return { status: p.status as 'succeeded' | 'failed', providerReference: p.providerReference };
+    return { status: p.status as ObservedStatus, providerReference: p.providerReference };
   }
 
-  /** Test/dev hook: queue faults to inject (FIFO). */
+  // ------------------------------------------------------- sandbox-only controls
+
+  /** Moves a payment along the provider's lifecycle (settle, return, reverse, ...). */
+  async advance(idempotencyKey: string, status: ObservedStatus) {
+    const p = await this.prisma.sandboxProviderPayment.findUnique({ where: { idempotencyKey } });
+    if (!p) return null;
+    return this.prisma.sandboxProviderPayment.update({ where: { idempotencyKey }, data: { status } });
+  }
+
+  /** Builds a signed webhook exactly as the sandbox provider would send it. */
+  signEvent(secret: string, event: { id: string; type: string; data: Record<string, unknown> }, at = new Date()) {
+    const body = JSON.stringify({ ...event, created: Math.floor(at.getTime() / 1000) });
+    const t = Math.floor(at.getTime() / 1000);
+    const v1 = createHmac('sha256', secret).update(`${t}.${body}`).digest('hex');
+    return { body, signature: `t=${t},v1=${v1}` };
+  }
+
   async queueFaults(faults: SandboxFault[]): Promise<void> {
     const base = Date.now();
     await this.prisma.sandboxFault.createMany({
@@ -134,7 +151,6 @@ export class SandboxPaymentAdapter implements PaymentAdapter {
     return rows.map((r) => ({ ...r, amountCents: Number(r.amountCents), createdAt: r.createdAt.toISOString() }));
   }
 
-  /** Consumes the oldest queued fault if it is one of `applicable`. */
   private async takeFault(applicable: SandboxFault[]): Promise<SandboxFault | null> {
     const next = await this.prisma.sandboxFault.findFirst({ orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] });
     if (!next || !applicable.includes(next.fault as SandboxFault)) return null;

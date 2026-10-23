@@ -53,9 +53,12 @@ describe('AgentTrust demo scenarios', () => {
     expect(auth.paymentRail).toBe('ach');
 
     const txn = await executeFor(agent, auth);
-    expect(txn.status).toBe('succeeded');
+    expect(txn.status).toBe('accepted'); // provider acceptance is NOT payment
     expect(txn.providerReference).toMatch(/^sbx_pay_/);
+    expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('processing');
 
+    // The provider later settles it (signed webhook) → only now is the invoice paid.
+    await world.platform.sandboxAdvance(auth.id, 'settled');
     const invoice = await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`);
     expect(invoice.status).toBe('paid');
     paidInvoiceId = invoiceId!;
@@ -138,13 +141,17 @@ describe('AgentTrust demo scenarios', () => {
     expect(mismatch.code).toBe('TRANSACTION_MISMATCH');
 
     expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('open');
-    expect((await executeFor(agent, auth)).status).toBe('succeeded');
+    expect((await executeFor(agent, auth)).status).toBe('accepted');
   });
 
-  it('8. Re-using a consumed authorization is blocked (single use)', async () => {
+  it('8. Re-using a consumed authorization never pays twice (single use)', async () => {
     const { poId, invoiceId, instructionId } = await world.order(agent, 40_000);
     const auth = await purchase(agent, { supplierId: world.supplierId, amountCents: 40_000, poId, invoiceId, instructionId });
-    expect((await executeFor(agent, auth)).status).toBe('succeeded');
+    expect((await executeFor(agent, auth)).status).toBe('accepted');
+    // While in flight, a replay only reconciles with the provider.
+    expect((await executeFor(agent, auth)).retried).toBe(true);
+    await world.platform.sandboxAdvance(auth.id, 'settled');
+    // Once final, a replay is refused outright.
     const replay = await apiError(executeFor(agent, auth));
     expect(replay.status).toBe(409);
     expect(replay.code).toBe('AUTHORIZATION_ALREADY_USED');
@@ -168,7 +175,7 @@ describe('AgentTrust demo scenarios', () => {
     const refreshed = await agent.client.authorizations.get(auth.id);
     expect(refreshed.token).toBeTruthy();
     expect(refreshed.reasonCodes).toContain('APPROVAL_GRANTED');
-    expect((await executeFor(agent, refreshed)).status).toBe('succeeded');
+    expect((await executeFor(agent, refreshed)).status).toBe('accepted');
   });
 
   it('10. Concurrent purchases cannot overspend the budget', async () => {
@@ -268,17 +275,21 @@ describe('AgentTrust demo scenarios', () => {
     expect(crashed.status).toBe(500); // the process "died" after the provider accepted the payment
 
     const stuck = await prisma.transaction.findUniqueOrThrow({ where: { authorizationId: auth.id } });
-    expect(stuck.status).toBe('executing');
+    expect(stuck.status).toBe('requested');
     expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('processing');
 
     // The agent retries with the same authorization: the gateway reconciles first.
     const retried = await executeFor(agent, auth);
-    expect(retried.status).toBe('succeeded');
+    expect(retried.status).toBe('accepted');
     expect(retried.retried).toBe(true);
     expect(retried.attempts).toBe(1); // no second execute call was sent
 
     const ledger = await world.platform.sandboxLedger(auth.id);
     expect(ledger.payments).toHaveLength(1); // exactly one payment at the provider
+    expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('processing');
+    // Retrying again while still in flight reconciles again; still one payment.
+    expect((await executeFor(agent, auth)).retried).toBe(true);
+    await world.platform.sandboxAdvance(auth.id, 'settled');
     expect((await world.admin.get<{ status: string }>(`/v1/invoices/${invoiceId}`)).status).toBe('paid');
 
     const again = await apiError(executeFor(agent, auth));
@@ -334,7 +345,7 @@ describe('AgentTrust demo scenarios', () => {
 
     const txn = await prisma.transaction.findUniqueOrThrow({ where: { authorizationId: auth.id } });
     const reconciled = await world.admin.post<{ status: string; attempts: number }>(`/v1/transactions/${txn.id}/reconcile`, {});
-    expect(reconciled.status).toBe('succeeded');
+    expect(reconciled.status).toBe('accepted');
     expect(reconciled.attempts).toBe(1);
     expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(1);
   });
@@ -347,12 +358,12 @@ describe('AgentTrust demo scenarios', () => {
     expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(0);
 
     const retried = await executeFor(agent, auth);
-    expect(retried.status).toBe('succeeded');
+    expect(retried.status).toBe('accepted');
     expect(retried.attempts).toBe(2);
     expect((await world.platform.sandboxLedger(auth.id)).payments).toHaveLength(1);
 
     const txn = await world.admin.get<{ providerAttempts: { action: string; outcome: string }[] }>(`/v1/transactions/${retried.id}`);
-    expect(txn.providerAttempts.map((x) => `${x.action}:${x.outcome}`)).toEqual(['execute:unknown', 'status_query:not_found', 'execute:succeeded']);
+    expect(txn.providerAttempts.map((x) => `${x.action}:${x.outcome}`)).toEqual(['execute:unknown', 'status_query:not_found', 'execute:accepted']);
   });
 
   it('18. Provider declines → FAILED; hold released and invoice reopened', async () => {

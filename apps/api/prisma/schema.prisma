@@ -61,10 +61,14 @@ enum PoStatus {
 
 enum InvoiceStatus {
   open
-  /// A payment for this invoice is executing or its outcome is being reconciled.
+  /// A payment for this invoice is in flight (requested/accepted/processing/unknown).
   processing
+  /// Paid only once the payment SETTLED (provider acceptance is not finality).
   paid
   void
+  /// A payment for this invoice failed after acceptance, was returned or reversed.
+  /// Not payable again until reconciled and explicitly released by an administrator.
+  payment_exception
 }
 
 enum Decision {
@@ -95,12 +99,19 @@ enum ReservationStatus {
   released
 }
 
-/// Payment state machine. A timeout is never treated as failure:
-/// executing -> succeeded | failed | unknown; unknown -> (reconcile) -> succeeded | failed | reconciliation_required
+/// Payment lifecycle. Provider ACCEPTANCE is not finality; only SETTLED is.
+///   requested -> accepted -> processing -> settled -> (returned | reversed)
+///   requested | accepted | processing -> failed
+///   requested -> unknown -> (reconcile) -> any observed provider state | reconciliation_required
+/// A timeout is never treated as failure.
 enum TransactionStatus {
-  executing
-  succeeded
+  requested
+  accepted
+  processing
+  settled
   failed
+  returned
+  reversed
   unknown
   reconciliation_required
 }
@@ -472,6 +483,12 @@ model Transaction {
   failureReason          String?
   attempts               Int               @default(0)
   lastAttemptAt          DateTime?
+  acceptedAt             DateTime?
+  settledAt              DateTime?
+  /// Set when an administrator resolves a failed/returned/reversed payment.
+  resolution             String?
+  resolvedAt             DateTime?
+  resolvedByUserId       String?
   /// Short lease so only one worker reconciles a transaction at a time.
   leaseUntil             DateTime?
   finalizedAt            DateTime?
@@ -674,4 +691,24 @@ model InvoiceLine {
   lineTotalCents        BigInt
 
   @@unique([invoiceId, lineNumber])
+}
+
+/// Every payment-provider event received (webhooks), deduplicated on (provider, eventId).
+model ProviderEvent {
+  id              String    @id
+  provider        String
+  eventId         String
+  type            String
+  idempotencyKey  String
+  transactionId   String?
+  organizationId  String?
+  payloadHash     String
+  /// applied | ignored_stale | ignored_terminal | unknown_transaction
+  outcome         String
+  detail          String?
+  occurredAt      DateTime?
+  receivedAt      DateTime  @default(now())
+
+  @@unique([provider, eventId])
+  @@index([idempotencyKey])
 }

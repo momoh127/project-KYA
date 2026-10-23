@@ -22,7 +22,7 @@ export const SECURITY_VIOLATION_CODES = new Set([
   'TRANSACTION_MISMATCH',
 ]);
 
-export type AlertCategory = 'auth_failures' | 'fraud_signal' | 'repeated_denials' | 'reconciliation_required';
+export type AlertCategory = 'auth_failures' | 'fraud_signal' | 'repeated_denials' | 'reconciliation_required' | 'payment_exception' | 'provider_event_conflict';
 
 /**
  * Graded responses to suspicious activity (replaces a blunt circuit breaker).

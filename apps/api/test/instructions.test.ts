@@ -135,7 +135,7 @@ describe('compromised agent with a valid session', () => {
   it('cannot reuse a single-use instruction; multi-use instructions are bounded by uses and quantities', async () => {
     const once = await world.order(agent, 12_000);
     const first = await purchase(agent, { ...once, amountCents: 12_000 });
-    expect((await executeFor(agent, first)).status).toBe('succeeded');
+    expect((await executeFor(agent, first)).status).toBe('accepted');
     const inv2 = await world.admin.post<{ id: string }>('/v1/invoices', {
       supplierId: world.supplierId, purchaseOrderId: once.poId, purchaseInstructionId: once.instructionId, invoiceNumber: `INV-${uniq()}`,
       amountCents: 12_000, currency: 'USD', lines: [{ lineNumber: 1, instructionLineNumber: 1, sku: once.sku, description: 'Tooling item', quantity: '1', unitPriceCents: 12_000 }],

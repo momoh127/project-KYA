@@ -10,6 +10,8 @@ const EnvSchema = z.object({
   AGENTTRUST_BOOTSTRAP_TOKEN: z.string().min(24),
   AGENTTRUST_DEV_AUTH: z.enum(['true', 'false']).default('false'),
   AGENTTRUST_DEV_AUTH_SECRET: z.string().min(32).optional(),
+  /** HMAC secret for sandbox payment-provider webhooks (>= 32 chars). Without it, webhooks are refused. */
+  AGENTTRUST_SANDBOX_WEBHOOK_SECRET: z.string().min(32).optional(),
   /** Background reconciliation interval for unknown payment outcomes. 0 disables. */
   AGENTTRUST_RECONCILE_INTERVAL_MS: z.coerce.number().int().min(0).default(30_000),
 });
@@ -24,6 +26,7 @@ export interface AppConfig {
   bootstrapToken: string;
   devAuth: { enabled: boolean; secret: string | null };
   reconcileIntervalMs: number;
+  sandboxWebhookSecret: string | null;
 }
 
 export const APP_CONFIG = Symbol('APP_CONFIG');
@@ -53,5 +56,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     bootstrapToken: e.AGENTTRUST_BOOTSTRAP_TOKEN,
     devAuth: { enabled: devEnabled, secret: e.AGENTTRUST_DEV_AUTH_SECRET ?? null },
     reconcileIntervalMs: e.AGENTTRUST_RECONCILE_INTERVAL_MS,
+    sandboxWebhookSecret: e.AGENTTRUST_SANDBOX_WEBHOOK_SECRET ?? null,
   };
 }

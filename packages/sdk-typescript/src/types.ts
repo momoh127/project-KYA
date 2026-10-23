@@ -88,12 +88,14 @@ export interface TransactionResponse {
   id: string;
   authorizationId: string;
   /**
-   * succeeded / failed are final. unknown / executing / reconciliation_required
-   * mean the outcome is NOT known yet: never treat these as failure and never
-   * request a new authorization to "try again". Retry execute with the same
-   * token (it reconciles, never re-pays) or poll.
+   * Provider ACCEPTANCE is not payment. Only `settled` means money moved and
+   * the invoice is paid; a settled payment can later be `returned`/`reversed`.
+   * requested / accepted / processing / unknown / reconciliation_required are
+   * in flight: never treat them as failure and never request a new
+   * authorization to "try again". Retry execute with the same token (it
+   * reconciles, never re-pays) or poll.
    */
-  status: 'executing' | 'succeeded' | 'failed' | 'unknown' | 'reconciliation_required';
+  status: 'requested' | 'accepted' | 'processing' | 'settled' | 'failed' | 'returned' | 'reversed' | 'unknown' | 'reconciliation_required';
   amountCents: number;
   currency: string;
   supplierId: string | null;
@@ -102,6 +104,8 @@ export interface TransactionResponse {
   providerIdempotencyKey: string;
   providerReference: string | null;
   attempts: number;
+  acceptedAt: string | null;
+  settledAt: string | null;
   /** True when this response came from reconciling an earlier attempt (no new payment was sent blindly). */
   retried?: boolean;
   createdAt: string;

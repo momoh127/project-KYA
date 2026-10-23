@@ -184,8 +184,11 @@ async function main() {
   const a1 = await agent.propose({ supplierId: supplier.id, payee: realBank, amountCents: 50_000, ...o1 });
   showDecision(a1);
   const t1 = await agent.pay(a1);
-  console.log(`  💸 ${c.dim('gateway:')} ${c.green(c.bold('PAID'))} ${c.dim(`${t1.providerReference} (sandbox)`)}`);
-  record('1. Approved supplier, $500', 'ALLOW→PAID', `${a1.decision}→${t1.status === 'succeeded' ? 'PAID' : t1.status}`);
+  console.log(`  📨 ${c.dim('gateway:')} ${c.yellow(c.bold(t1.status.toUpperCase()))} ${c.dim(`by provider (${t1.providerReference}); acceptance is not payment, invoice stays "processing"`)}`);
+  await platform.sandboxAdvance(a1.id, 'settled');
+  const inv1 = await sarah.get<{ status: string }>(`/v1/invoices/${o1.invoiceId}`);
+  console.log(`  🏦 ${c.dim('provider webhook (signed):')} payment.settled → invoice ${c.green(c.bold(inv1.status.toUpperCase()))}`);
+  record('1. Approved supplier, $500', 'ALLOW→accepted→PAID', `${a1.decision}→${t1.status}→${inv1.status === 'paid' ? 'PAID' : inv1.status}`);
 
   // ---- 2 ---------------------------------------------------------------------
   header('2', '$5,000 against a $500 approval');
@@ -236,7 +239,8 @@ async function main() {
   // ---- 8 ---------------------------------------------------------------------
   header('8', 'Re-using an authorization');
   await agent.pay(a7);
-  console.log(`  💸 ${c.dim('gateway:')} ${c.green('PAID')} ${c.dim('the legitimate $500 once')}`);
+  await platform.sandboxAdvance(a7.id, 'settled');
+  console.log(`  💸 ${c.dim('gateway:')} ${c.green('PAID')} ${c.dim('the legitimate $500 once (accepted → settled)')}`);
   agentSays('That worked! Let me run the same payment again.');
   const r8 = await blocked(agent.pay(a7));
   record('8. Replay of used authorization', 'BLOCKED', r8);
@@ -252,8 +256,10 @@ async function main() {
   const a9b = await agent.client.authorizations.get(a9.id);
   showDecision(a9b);
   const t9 = await agent.pay(a9b);
-  console.log(`  💸 ${c.dim('gateway:')} ${c.green(c.bold('PAID'))} ${c.dim(t9.providerReference ?? '')}`);
-  record('9. Review → approve → pay', 'REVIEW→PAID', `${a9.decision}→${t9.status === 'succeeded' ? 'PAID' : t9.status}`);
+  await platform.sandboxAdvance(a9.id, 'settled');
+  const inv9 = await sarah.get<{ status: string }>(`/v1/invoices/${o9.invoiceId}`);
+  console.log(`  💸 ${c.dim('gateway:')} ${t9.status} → settled → invoice ${c.green(c.bold(inv9.status.toUpperCase()))}`);
+  record('9. Review → approve → pay', 'REVIEW→PAID', `${a9.decision}→${inv9.status === 'paid' ? 'PAID' : inv9.status}`);
 
   const newAgent = async (name: string, maxTransactionCents: number, monthlyLimitCents: number) => {
     const k = generateEd25519KeyPair();

@@ -27,7 +27,8 @@ import { SecurityMonitorService } from './security/security-monitor.service';
 import { SuppliersController } from './suppliers/suppliers.controller';
 import { PAYMENT_ADAPTER, SandboxPaymentAdapter } from './transactions/payment-adapter';
 import { ReconcilerService } from './transactions/reconciler.service';
-import { SandboxController } from './transactions/sandbox.controller';
+import { PaymentEventsService } from './transactions/payment-events.service';
+import { SandboxController, WebhooksController } from './transactions/sandbox.controller';
 import { TransactionsController } from './transactions/transactions.controller';
 import { TransactionsService } from './transactions/transactions.service';
 
@@ -52,6 +53,7 @@ export class AppModule {
         AuthorizationsController,
         TransactionsController,
         SandboxController,
+        WebhooksController,
         AuditController,
       ],
       providers: [
@@ -71,6 +73,7 @@ export class AppModule {
         InstructionsService,
         AuthorizationsService,
         TransactionsService,
+        PaymentEventsService,
         ReconcilerService,
         // Production: replace with a real provider adapter (Stripe, Modern Treasury, bank API).
         { provide: PAYMENT_ADAPTER, useClass: SandboxPaymentAdapter },

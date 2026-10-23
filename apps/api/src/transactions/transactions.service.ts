@@ -1,5 +1,5 @@
 import { HttpStatus, Inject, Injectable, Logger } from '@nestjs/common';
-import type { Transaction, TransactionStatus } from '@prisma/client';
+import type { Transaction } from '@prisma/client';
 import { tokenMismatches, verifyAuthorizationToken, type AuthorizationClaims } from '@agenttrust/authorization';
 import { IdPrefix, newId, type PaymentLine } from '@agenttrust/shared';
 import type { AgentPrincipal, HumanPrincipal } from '../auth/principal';
@@ -10,7 +10,8 @@ import { CryptoService } from '../common/crypto.service';
 import { ApiError, Errors } from '../common/errors';
 import { cents, PrismaService } from '../common/prisma.service';
 import { SECURITY_VIOLATION_CODES, SecurityMonitorService } from '../security/security-monitor.service';
-import { PAYMENT_ADAPTER, SimulatedProcessCrash, type PaymentAdapter, type PaymentResult } from './payment-adapter';
+import { canTransition, IN_FLIGHT, isTerminal, type ObservedStatus } from './lifecycle';
+import { PAYMENT_ADAPTER, SimulatedProcessCrash, type PaymentAdapter } from './payment-adapter';
 
 export interface ExecuteBody {
   token: string;
@@ -23,7 +24,6 @@ export interface ExecuteBody {
   };
 }
 
-const NON_FINAL: TransactionStatus[] = ['executing', 'unknown', 'reconciliation_required'];
 export const MAX_PROVIDER_ATTEMPTS = 3;
 const LEASE_MS = 30_000;
 
@@ -38,19 +38,21 @@ class GatewayRejection extends Error {
  * THE ENFORCEMENT POINT: the only component holding payment credentials and
  * the only path by which an agent's purchase is paid.
  *
- * Payment state machine (Authorization → Reservation → Transaction):
+ * Payment lifecycle (Authorization → Reservation → Transaction → Invoice):
  *
- *   authorization: allowed ──consume──▶ consumed            (single use)
- *   reservation:   active  ──────────▶ consumed | released  (budget/PO/invoice hold)
- *   invoice:       open ─▶ processing ─▶ paid | open
- *   transaction:   executing ─▶ succeeded
- *                            ─▶ failed                       (definitive decline)
- *                            ─▶ unknown ─reconcile─▶ succeeded | failed | reconciliation_required
+ *   authorization: allowed ──consume──▶ consumed                 (single use)
+ *   transaction:   requested ─▶ accepted ─▶ processing ─▶ settled ─▶ returned | reversed
+ *                  requested | accepted | processing ─▶ failed
+ *                  requested ─▶ unknown ─reconcile─▶ observed state | reconciliation_required
+ *   invoice:       open ─▶ processing ─▶ paid (ONLY on settled)
+ *                  processing | paid ─▶ payment_exception (failed after acceptance, returned, reversed)
+ *   reservation:   active ─▶ consumed ─▶ released (only: decline before acceptance, or explicit admin release)
  *
- * A timeout is NEVER treated as failure. Before any retry the gateway asks
- * the provider what happened to the previous attempt (by idempotency key),
- * and every provider call carries the same idempotency key, so a crash or
- * timeout can never produce a second payment.
+ * Provider acceptance is not finality. A timeout is never treated as failure.
+ * Before any retry the gateway reconciles with the provider by idempotency
+ * key. A returned/reversed payment is never automatically eligible to be paid
+ * again: it requires reconciliation and explicit administrator release, after
+ * which the agent must obtain a NEW authorization.
  */
 @Injectable()
 export class TransactionsService {
@@ -116,7 +118,7 @@ export class TransactionsService {
 
       if (auth.status === 'consumed') {
         const existing = await tx.transaction.findUnique({ where: { authorizationId: auth.id } });
-        if (existing && NON_FINAL.includes(existing.status)) return { kind: 'retry' as const, transaction: existing };
+        if (existing && IN_FLIGHT.includes(existing.status)) return { kind: 'retry' as const, transaction: existing };
         throw new GatewayRejection('AUTHORIZATION_ALREADY_USED', 'Authorization has already been used', {
           transactionId: existing?.id ?? null,
           transactionStatus: existing?.status ?? null,
@@ -204,7 +206,7 @@ export class TransactionsService {
           invoiceId: auth.invoiceId,
           amountCents: auth.amountCents,
           currency: auth.currency,
-          status: 'executing',
+          status: 'requested',
           provider: this.payments.name,
           providerIdempotencyKey: auth.id,
         },
@@ -213,7 +215,7 @@ export class TransactionsService {
         organizationId: agent.organizationId,
         actorType: 'agent',
         actorId: agent.agentId,
-        eventType: 'execution.started',
+        eventType: 'payment.requested',
         subjectId: transaction.id,
         payload: {
           authorizationId: auth.id,
@@ -238,7 +240,7 @@ export class TransactionsService {
       where: { id: transaction.id },
       data: { attempts: { increment: 1 }, lastAttemptAt: new Date() },
     });
-    let result: PaymentResult;
+    let result: Awaited<ReturnType<PaymentAdapter['execute']>>;
     try {
       result = await this.payments.execute({
         idempotencyKey: transaction.providerIdempotencyKey,
@@ -252,17 +254,19 @@ export class TransactionsService {
       result = { status: 'unknown', providerReference: null, detail: e instanceof Error ? e.message : 'provider error' };
     }
     await this.recordAttempt(transaction, bumped.attempts, 'execute', result.status, result.providerReference, result.detail);
-    return this.applyOutcome(transaction.id, result, actor);
+    if (result.status === 'unknown') return this.markUnknown(transaction.id, result.detail ?? null, actor);
+    return (await this.applyObserved(transaction.id, result.status, result.providerReference, actor, result.detail ?? null)).transaction;
   }
 
   /**
-   * Reconciles a non-final transaction with the provider. Never sends a new
+   * Reconciles an in-flight transaction with the provider. Never sends a new
    * payment request without first asking the provider about the previous one.
+   * Also used to poll accepted/processing payments for delayed settlement.
    */
   async reconcile(transactionId: string, actor: string) {
     const now = new Date();
     const claimed = await this.prisma.transaction.updateMany({
-      where: { id: transactionId, status: { in: NON_FINAL }, OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }] },
+      where: { id: transactionId, status: { in: IN_FLIGHT }, OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }] },
       data: { leaseUntil: new Date(now.getTime() + LEASE_MS) },
     });
     if (claimed.count === 0) return serializeTransaction(await this.prisma.transaction.findUniqueOrThrow({ where: { id: transactionId } }));
@@ -277,20 +281,18 @@ export class TransactionsService {
       }
       await this.recordAttempt(t, t.attempts, 'status_query', status?.status ?? 'unknown', status?.providerReference ?? null, status ? null : 'status lookup failed');
 
-      if (status?.status === 'succeeded' || status?.status === 'failed') {
-        return await this.applyOutcome(t.id, { status: status.status, providerReference: status.providerReference, detail: 'resolved by reconciliation' }, `reconciler:${actor}`);
+      if (status && status.status !== 'not_found') {
+        return (await this.applyObserved(t.id, status.status, status.providerReference, `reconciler:${actor}`, 'observed by status query')).transaction;
       }
-      if (status?.status === 'not_found') {
-        // The provider never received the payment. Re-sending with the SAME
-        // idempotency key is safe (the provider deduplicates on it).
+      if (status?.status === 'not_found' && (t.status === 'requested' || t.status === 'unknown')) {
+        // The provider never received it. Re-sending with the SAME idempotency key is safe.
         if (t.attempts < MAX_PROVIDER_ATTEMPTS) {
           const auth = await this.prisma.authorization.findUniqueOrThrow({ where: { id: t.authorizationId } });
           return await this.attempt(t, auth.destinationRef!, `Authorization ${auth.id} (retry)`, `reconciler:${actor}`);
         }
         return await this.requireManualReconciliation(t, 'provider has no record after maximum attempts');
       }
-      // pending / lookup failed: still unknown. Escalate once attempts are exhausted.
-      if (t.attempts >= MAX_PROVIDER_ATTEMPTS && t.status !== 'reconciliation_required') {
+      if (!status && t.attempts >= MAX_PROVIDER_ATTEMPTS && (t.status === 'requested' || t.status === 'unknown')) {
         return await this.requireManualReconciliation(t, 'outcome still unknown after maximum attempts');
       }
       return serializeTransaction(await this.prisma.transaction.findUniqueOrThrow({ where: { id: t.id } }));
@@ -299,55 +301,115 @@ export class TransactionsService {
     }
   }
 
-  /** Applies a provider outcome exactly once (conditional on the transaction still being non-final). */
-  private async applyOutcome(transactionId: string, result: PaymentResult, actor: string) {
+  private async markUnknown(transactionId: string, detail: string | null, actor: string) {
     return this.prisma.tx(async (tx) => {
       const t = await tx.transaction.findUniqueOrThrow({ where: { id: transactionId } });
-      const now = new Date();
-
-      if (result.status === 'unknown') {
-        const moved = await tx.transaction.updateMany({ where: { id: t.id, status: 'executing' }, data: { status: 'unknown' } });
-        if (moved.count === 1) {
-          await this.audit.append(tx, {
-            organizationId: t.organizationId, actorType: 'system', actorId: actor, eventType: 'execution.outcome_unknown', subjectId: t.id,
-            payload: { authorizationId: t.authorizationId, detail: result.detail ?? null, attempts: t.attempts },
-          });
-        }
-        return serializeTransaction(await tx.transaction.findUniqueOrThrow({ where: { id: t.id } }));
-      }
-
-      const finalStatus = result.status;
-      const moved = await tx.transaction.updateMany({
-        where: { id: t.id, status: { in: NON_FINAL } },
-        data: { status: finalStatus, providerReference: result.providerReference, failureReason: finalStatus === 'failed' ? result.detail ?? 'failed' : null, finalizedAt: now },
-      });
+      const moved = await tx.transaction.updateMany({ where: { id: t.id, status: 'requested' }, data: { status: 'unknown' } });
       if (moved.count === 1) {
-        if (finalStatus === 'succeeded') {
-          if (t.invoiceId) {
-            await tx.invoice.updateMany({ where: { id: t.invoiceId, status: 'processing' }, data: { status: 'paid', paidAt: now, paidByTransactionId: t.id } });
-          }
-        } else {
-          // Money did not move: release the hold and reopen the invoice. The
-          // authorization stays consumed; a new authorization is required.
-          await tx.budgetReservation.updateMany({ where: { authorizationId: t.authorizationId }, data: { status: 'released' } });
-          if (t.invoiceId) await tx.invoice.updateMany({ where: { id: t.invoiceId, status: 'processing' }, data: { status: 'open' } });
-        }
         await this.audit.append(tx, {
-          organizationId: t.organizationId, actorType: 'system', actorId: actor,
-          eventType: finalStatus === 'succeeded' ? 'execution.succeeded' : 'execution.failed', subjectId: t.id,
-          payload: { authorizationId: t.authorizationId, providerReference: result.providerReference, detail: result.detail ?? null, attempts: t.attempts },
+          organizationId: t.organizationId, actorType: 'system', actorId: actor, eventType: 'payment.outcome_unknown', subjectId: t.id,
+          payload: { authorizationId: t.authorizationId, detail, attempts: t.attempts },
         });
       }
       return serializeTransaction(await tx.transaction.findUniqueOrThrow({ where: { id: t.id } }));
     });
   }
 
+  /**
+   * Applies a provider-observed state through the state machine, exactly once.
+   * Stale, duplicate or out-of-order observations are ignored (never move a
+   * payment backwards). Used by execute responses, status queries and webhooks.
+   */
+  async applyObserved(transactionId: string, observed: ObservedStatus, providerReference: string | null, actor: string, detail: string | null) {
+    const result = await this.prisma.tx(async (tx) => {
+      const t = await tx.transaction.findUniqueOrThrow({ where: { id: transactionId } });
+      if (!canTransition(t.status, observed)) {
+        return { outcome: isTerminal(t.status) ? 'ignored_terminal' : 'ignored_stale', transaction: t, raise: false };
+      }
+      const now = new Date();
+      const wasAccepted = t.acceptedAt !== null || t.status === 'accepted' || t.status === 'processing' || t.status === 'settled';
+      const reachedProvider = observed === 'accepted' || observed === 'processing' || observed === 'settled';
+      const moved = await tx.transaction.updateMany({
+        where: { id: t.id, status: t.status },
+        data: {
+          status: observed,
+          providerReference: providerReference ?? t.providerReference,
+          ...(reachedProvider && !t.acceptedAt ? { acceptedAt: now } : {}),
+          ...(observed === 'settled' ? { settledAt: now, finalizedAt: now } : {}),
+          ...(observed === 'failed' || observed === 'returned' || observed === 'reversed' ? { finalizedAt: now, failureReason: detail ?? observed } : {}),
+        },
+      });
+      if (moved.count !== 1) return { outcome: 'ignored_stale', transaction: t, raise: false };
+
+      let raise = false;
+      if (observed === 'settled') {
+        if (t.invoiceId) await tx.invoice.updateMany({ where: { id: t.invoiceId, status: 'processing' }, data: { status: 'paid', paidAt: now, paidByTransactionId: t.id } });
+      } else if (observed === 'failed' && !wasAccepted) {
+        // Declined before the provider ever accepted it: no money moved, release automatically.
+        await tx.budgetReservation.updateMany({ where: { authorizationId: t.authorizationId }, data: { status: 'released' } });
+        if (t.invoiceId) await tx.invoice.updateMany({ where: { id: t.invoiceId, status: 'processing' }, data: { status: 'open' } });
+      } else if (observed === 'failed' || observed === 'returned' || observed === 'reversed') {
+        // Money may have moved (or moved and came back). Hold everything until reconciled and explicitly released.
+        if (t.invoiceId) await tx.invoice.updateMany({ where: { id: t.invoiceId, status: { in: ['processing', 'paid'] } }, data: { status: 'payment_exception', paidAt: null } });
+        raise = true;
+      }
+      await this.audit.append(tx, {
+        organizationId: t.organizationId, actorType: 'system', actorId: actor, eventType: `payment.${observed}`, subjectId: t.id,
+        payload: { authorizationId: t.authorizationId, from: t.status, providerReference: providerReference ?? t.providerReference, detail, attempts: t.attempts },
+      });
+      return { outcome: 'applied', transaction: (await tx.transaction.findUniqueOrThrow({ where: { id: t.id } })), raise };
+    });
+    if (result.raise) {
+      await this.security.raiseAlert(result.transaction.organizationId, result.transaction.id, 'payment_exception', new Date(0), {
+        severity: 'high', transactionId: result.transaction.id, status: result.transaction.status,
+        message: `Payment ${result.transaction.status} after provider acceptance. The invoice is on hold; reconcile with the provider and explicitly release before any new payment.`,
+      });
+    }
+    return { outcome: result.outcome, transaction: serializeTransaction(result.transaction) };
+  }
+
+  /**
+   * Explicit administrator release of a failed/returned/reversed payment so the
+   * obligation can be re-authorized. Re-confirms the provider state first and
+   * refuses if the provider says money is (still) moving or settled.
+   */
+  async resolveException(user: HumanPrincipal, transactionId: string, note: string) {
+    const t = await this.prisma.transaction.findFirst({ where: { id: transactionId, organizationId: user.organizationId } });
+    if (!t) throw Errors.notFound('Transaction');
+    if (!['failed', 'returned', 'reversed'].includes(t.status) || t.resolvedAt) {
+      throw Errors.conflict('NOT_RESOLVABLE', `Transaction is ${t.status}${t.resolvedAt ? ' (already resolved)' : ''}`);
+    }
+    let provider: Awaited<ReturnType<PaymentAdapter['getStatus']>>;
+    try {
+      provider = await this.payments.getStatus(t.providerIdempotencyKey);
+    } catch {
+      throw Errors.unavailable('Cannot confirm the payment state with the provider; not released');
+    }
+    if (!['failed', 'returned', 'reversed', 'not_found'].includes(provider.status)) {
+      throw Errors.conflict('PROVIDER_DISAGREES', `Provider reports "${provider.status}"; reconcile before releasing`);
+    }
+    return this.prisma.tx(async (tx) => {
+      const moved = await tx.transaction.updateMany({
+        where: { id: t.id, resolvedAt: null },
+        data: { resolution: 'released_for_reauthorization', resolvedAt: new Date(), resolvedByUserId: user.userId },
+      });
+      if (moved.count !== 1) throw Errors.conflict('NOT_RESOLVABLE', 'Already resolved');
+      await tx.budgetReservation.updateMany({ where: { authorizationId: t.authorizationId, status: { in: ['consumed', 'active'] } }, data: { status: 'released' } });
+      if (t.invoiceId) await tx.invoice.updateMany({ where: { id: t.invoiceId, status: 'payment_exception' }, data: { status: 'open', paidByTransactionId: null } });
+      await this.audit.append(tx, {
+        organizationId: t.organizationId, actorType: 'user', actorId: user.userId, eventType: 'payment.released_for_reauthorization', subjectId: t.id,
+        payload: { authorizationId: t.authorizationId, transactionStatus: t.status, providerStatus: provider.status, note },
+      });
+      return serializeTransaction((await tx.transaction.findUniqueOrThrow({ where: { id: t.id } })));
+    });
+  }
+
   private async requireManualReconciliation(t: Transaction, reason: string) {
     const updated = await this.prisma.tx(async (tx) => {
-      const moved = await tx.transaction.updateMany({ where: { id: t.id, status: { in: ['executing', 'unknown'] } }, data: { status: 'reconciliation_required', failureReason: reason } });
+      const moved = await tx.transaction.updateMany({ where: { id: t.id, status: { in: ['requested', 'unknown'] } }, data: { status: 'reconciliation_required', failureReason: reason } });
       if (moved.count === 1) {
         await this.audit.append(tx, {
-          organizationId: t.organizationId, actorType: 'system', actorId: 'reconciler', eventType: 'execution.reconciliation_required', subjectId: t.id,
+          organizationId: t.organizationId, actorType: 'system', actorId: 'reconciler', eventType: 'payment.reconciliation_required', subjectId: t.id,
           payload: { authorizationId: t.authorizationId, reason, attempts: t.attempts },
         });
       }
@@ -379,7 +441,7 @@ export class TransactionsService {
   async reconcileStale(olderThanMs: number, limit = 20): Promise<number> {
     const cutoff = new Date(Date.now() - olderThanMs);
     const stale = await this.prisma.transaction.findMany({
-      where: { status: { in: ['executing', 'unknown'] }, OR: [{ lastAttemptAt: null }, { lastAttemptAt: { lt: cutoff } }] },
+      where: { status: { in: ['requested', 'unknown', 'accepted', 'processing'] }, OR: [{ lastAttemptAt: null }, { lastAttemptAt: { lt: cutoff } }] },
       take: limit,
       select: { id: true },
     });
@@ -431,7 +493,10 @@ export function serializeTransaction(t: Transaction) {
     providerReference: t.providerReference,
     failureReason: t.failureReason,
     attempts: t.attempts,
+    acceptedAt: t.acceptedAt?.toISOString() ?? null,
+    settledAt: t.settledAt?.toISOString() ?? null,
     finalizedAt: t.finalizedAt?.toISOString() ?? null,
+    resolution: t.resolution,
     createdAt: t.createdAt.toISOString(),
   };
 }
