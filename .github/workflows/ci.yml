@@ -51,3 +51,11 @@ jobs:
             release/*|hotfix/*) echo "ok: ${{ github.head_ref }}";;
             *) echo "::error::main accepts merges only from release/* or hotfix/* (got ${{ github.head_ref }})"; exit 1;;
           esac
+
+  # The hosted sandbox deploys this image from main: it must build on every integration/release branch.
+  docker-image:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t agenttrust-sandbox:ci .

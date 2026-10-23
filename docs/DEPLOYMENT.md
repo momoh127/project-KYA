@@ -10,6 +10,10 @@ See the [README quick start](../README.md#quick-start). Two database options:
 Environment variables are documented in [`.env.example`](../.env.example). The API refuses to start with
 missing or weak secrets, and refuses dev login when `NODE_ENV=production`.
 
+## Hosted evaluation sandbox
+
+See [HOSTED_SANDBOX.md](HOSTED_SANDBOX.md) (Render blueprint + Docker image; sandbox only).
+
 ## Production (not yet built; target design)
 
 | Concern | Target |
