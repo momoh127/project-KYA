@@ -47,6 +47,7 @@ export interface PurchaseInstruction {
 
 export interface AuthorizationResponse {
   id: string;
+  agentId: string;
   decision: Decision;
   status: AuthorizationStatus;
   reasonCodes: ReasonCode[];
