@@ -766,3 +766,23 @@ model AuditAnchor {
 
   @@unique([organizationId, toSequence])
 }
+
+/// SANDBOX ONLY: a self-service evaluation organization. The sandbox key is
+/// shown once at signup and stored only as a keyed hash. It can mint
+/// development tokens for this organization's three sandbox personas and drive
+/// the sandbox payment provider for this organization's own payments.
+model SandboxAccount {
+  organizationId  String    @id
+  keyHash         String    @unique
+  /// First characters of the key, to help a developer identify it (not secret).
+  keyPrefix       String
+  email           String
+  adminUserId     String
+  verifierUserId  String
+  approverUserId  String
+  createdAt       DateTime  @default(now())
+  expiresAt       DateTime
+  lastUsedAt      DateTime?
+
+  @@index([createdAt])
+}

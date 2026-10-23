@@ -19,6 +19,12 @@ const EnvSchema = z.object({
   AGENTTRUST_ANCHOR_INTERVAL_MS: z.coerce.number().int().min(0).default(300_000),
   /** Background reconciliation interval for unknown payment outcomes. 0 disables. */
   AGENTTRUST_RECONCILE_INTERVAL_MS: z.coerce.number().int().min(0).default(30_000),
+  /** Self-service sandbox signup (hosted evaluation sandbox). Refused in production; requires dev auth. */
+  AGENTTRUST_SANDBOX_SIGNUP: z.enum(['true', 'false']).default('false'),
+  /** Platform-wide cap on new sandbox organizations per rolling 24 h (abuse limit). */
+  AGENTTRUST_SANDBOX_MAX_SIGNUPS_PER_DAY: z.coerce.number().int().min(1).max(100_000).default(200),
+  /** Sandbox organization lifetime. */
+  AGENTTRUST_SANDBOX_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(30),
 });
 
 export interface AppConfig {
@@ -34,6 +40,7 @@ export interface AppConfig {
   sandboxWebhookSecret: string | null;
   anchorDir: string;
   anchorIntervalMs: number;
+  sandboxSignup: { enabled: boolean; maxPerDay: number; ttlDays: number };
 }
 
 export const APP_CONFIG = Symbol('APP_CONFIG');
@@ -53,6 +60,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (devEnabled && !e.AGENTTRUST_DEV_AUTH_SECRET) {
     throw new Error('AGENTTRUST_DEV_AUTH_SECRET is required when dev auth is enabled');
   }
+  const signupEnabled = e.AGENTTRUST_SANDBOX_SIGNUP === 'true';
+  if (signupEnabled && e.NODE_ENV === 'production') {
+    throw new Error('AGENTTRUST_SANDBOX_SIGNUP must not be enabled in production');
+  }
+  if (signupEnabled && !devEnabled) {
+    throw new Error('AGENTTRUST_SANDBOX_SIGNUP requires AGENTTRUST_DEV_AUTH=true (sandbox personas use development tokens)');
+  }
+  if (signupEnabled && !e.AGENTTRUST_SANDBOX_WEBHOOK_SECRET) {
+    throw new Error('AGENTTRUST_SANDBOX_SIGNUP requires AGENTTRUST_SANDBOX_WEBHOOK_SECRET (payments settle via signed webhooks)');
+  }
   return {
     nodeEnv: e.NODE_ENV,
     databaseUrl: e.DATABASE_URL,
@@ -66,5 +83,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     sandboxWebhookSecret: e.AGENTTRUST_SANDBOX_WEBHOOK_SECRET ?? null,
     anchorDir: e.AGENTTRUST_ANCHOR_DIR ?? path.resolve(process.cwd(), '.local', 'anchors'),
     anchorIntervalMs: e.AGENTTRUST_ANCHOR_INTERVAL_MS,
+    sandboxSignup: { enabled: signupEnabled, maxPerDay: e.AGENTTRUST_SANDBOX_MAX_SIGNUPS_PER_DAY, ttlDays: e.AGENTTRUST_SANDBOX_TTL_DAYS },
   };
 }
