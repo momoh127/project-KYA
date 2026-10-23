@@ -1,7 +1,7 @@
 {
   "name": "agenttrust",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "AgentTrust: the authorization layer for AI agents that spend money.",
   "license": "UNLICENSED",
   "packageManager": "pnpm@9.15.4",
