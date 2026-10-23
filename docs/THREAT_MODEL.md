@@ -1,4 +1,4 @@
-# Threat Model (MVP v0.3)
+# Threat Model (v0.4)
 
 Method: assets → actors → attacks → mitigations → residual risk. Every mitigation marked "Tested" has an automated
 test in `apps/api/test/` or `packages/*/test/`.
@@ -60,6 +60,20 @@ holds any *other* payment credential or tool is outside this model (see R0).
 | T25 | Insider with DB superuser AND platform key rewrites audit history | Signed Merkle anchors in write-once storage outside the DB; independent verifier reads anchors from storage | Tested (rewrite detected) |
 | T26 | Concurrent agents overspend a shared PO | Row lock on the shared PurchaseOrder (not just per-agent locks) | Tested (fails without the lock) |
 
+### v0.4 additions: hosted sandbox and developer surface
+
+These apply to **sandbox** deployments (`AGENTTRUST_SANDBOX_SIGNUP=true`, refused when `NODE_ENV=production`).
+
+| # | Attack | Mitigation | Status |
+|---|---|---|---|
+| T27 | Mass self-service signups (resource exhaustion, spam orgs) | Per-client throttle (20/h; real client IP via `AGENTTRUST_TRUST_PROXY`), platform-wide daily cap (`SANDBOX_CAPACITY`), sandbox expiry, strict request schema | Tested (cap, schema); throttle by framework |
+| T28 | Sandbox key theft or guessing | 192-bit random key shown once; stored only as a domain-separated keyed hash; strict format check; org-scoped; expiry; never written to audit or metrics | Tested |
+| T29 | One sandbox touches another's data (persona tokens, payment advance) | Personas are users of that org only; the advance endpoint resolves the transaction and returns 404 unless it belongs to the key's org; normal tenant isolation for everything else | Tested (mutation-checked) |
+| T30 | Sandbox convenience relaxes real controls | Sandbox signup uses the same org-creation path; dual control and requester ≠ approver are still enforced between personas (one developer simply holds all three) | Tested (self-verification refused) |
+| T31 | Developer portal abused (path traversal, file disclosure, markup injection) | Fixed page list; downloads only exact allow-listed artifact names in one directory; forged Host header falls back to localhost; content is our own docs | Tested (mutation-checked) |
+| T32 | SDKs diverge on the signing wire format | Committed AGENTTRUST-ED25519-V1 vectors from the TS reference; both SDKs must reproduce them byte for byte | Tested (mutation-checked) |
+| T33 | Docs drift from the real API (integrators build against fiction) | OpenAPI drift test: every documented operation served, refs resolve, reason codes real; quickstarts run in CI | Tested |
+
 ## Residual risks (unresolved, documented)
 
 | # | Risk | Plan |
@@ -78,3 +92,10 @@ holds any *other* payment credential or tool is outside this model (see R0).
 | R8 | Sandbox provider only; real adapters must meet the idempotency + status-lookup contract | Stripe / Modern Treasury adapters + contract tests |
 | R9 | Rate limiting is per-process memory; `SecuritySignal` / nonce tables grow | Redis limits; TTL cleanup jobs |
 | R10 | Webhook signing not implemented (no webhooks yet) | Signed webhooks with timestamp + id dedupe |
+| R14 | **Hosted sandbox human auth is development tokens**; anyone holding a sandbox key acts as all three personas of that sandbox | By design for evaluation; never enable signup outside sandbox (config refuses in production); OIDC for real tenants |
+| R15 | Sandbox keys cannot be rotated or revoked by the developer (only expire) | Add rotate/revoke endpoints if design partners keep sandboxes longer |
+| R16 | Hosted signing key derived from a platform-generated seed (`AGENTTRUST_SIGNING_KEY_SEED`); anchors on ephemeral container disk | Sandbox only; production: KMS signer + S3 Object Lock (R1, R3) |
+| R17 | Distributed SDK artifacts (tarball, wheel) are unsigned; served over the sandbox's TLS | Publish to npm/PyPI with provenance / Sigstore signing |
+| R18 | Developer portal loads Scalar and Mermaid from a public CDN | No secrets on portal pages; pin versions with SRI or self-host if the portal handles anything sensitive |
+| R19 | Rate limiting is per process memory; signup throttle resets on restart / differs per replica | Redis-backed limits (see R9); daily cap is DB-backed |
+| R20 | Integration Pattern B (customer's payment service verifies and consumes) is not built; customers owning their payment call can only use AgentTrust advisorily until it exists | Build if design partners need it; documented as anti-pattern meanwhile |

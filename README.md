@@ -26,7 +26,8 @@ AgentTrust gateway (sole holder of payment credentials) ──▶ provider: acce
 
 > [!WARNING]
 > MVP running against **sandbox** payment and account-verification providers. Not production-certified, compliant,
-> or independently audited. Known gaps: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md#residual-risks-unresolved-documented).
+> or independently audited. The hosted sandbox uses development persona logins and moves no real money. Known gaps:
+> [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md#residual-risks-unresolved-documented).
 
 ## What it verifies
 
@@ -40,7 +41,24 @@ AgentTrust gateway (sole holder of payment credentials) ──▶ provider: acce
 | **Execution** | Single-use token bound to the complete instruction; gateway re-verifies current records; idempotent provider calls; settlement-based finality; reconciliation before any retry |
 | **Evidence** | Signed hash-chained audit, DB append-only, Merkle-anchored to write-once storage, independent verifier |
 
-## Quick start
+## Developer experience (v0.4)
+
+Goal: an external developer completes a sandbox authorization integration in **under 30 minutes** without our help,
+and we can **measure** it.
+
+| | |
+|---|---|
+| **Quickstart** | [docs/developer/QUICKSTART.md](docs/developer/QUICKSTART.md): signup → settled sandbox payment → blocked attacks |
+| **Integration Guide** | [docs/developer/INTEGRATION_GUIDE.md](docs/developer/INTEGRATION_GUIDE.md): trust boundaries, instruction sources (human/ERP), enforcement patterns, finality, errors, keys |
+| **API reference** | [docs/developer/openapi.yaml](docs/developer/openapi.yaml) (OpenAPI 3.1; a test keeps it in sync with the running app) |
+| **TypeScript SDK** | `packages/sdk-typescript`: agent / admin / sandbox clients; zero-dependency release tarball (`pnpm --filter @agenttrust/sdk pack:release`) |
+| **Python SDK** | `packages/sdk-python` (`agenttrust`): same surface; stdlib HTTP + `cryptography`; byte-compatible signing via shared test vectors |
+| **Hosted sandbox** | Self-service signup with admin/verifier/approver personas; portal at `/docs`, SDK downloads at `/downloads`; [Render blueprint](render.yaml) + [Dockerfile](Dockerfile); see [docs/HOSTED_SANDBOX.md](docs/HOSTED_SANDBOX.md) |
+| **Measurement** | `GET /v1/sandbox/metrics` (operator): minutes from signup to first settled payment, per sandbox; [evaluation protocol](docs/developer/EVALUATION_PROTOCOL.md) |
+| **Demo video** | `vhs demo/video/agenttrust-90s.tape` (≈ 77 s, six beats) + [voice-over script](demo/video/VOICEOVER.md) |
+| **Examples** | [`examples/quickstart-typescript`](examples/quickstart-typescript/quickstart.ts), [`examples/quickstart-python`](examples/quickstart-python/quickstart.py), both run in CI |
+
+## Quick start (run it locally)
 
 Prerequisites: Node 20+, pnpm 9, PostgreSQL 14+ binaries (`brew install postgresql@14`) **or** Docker.
 
@@ -64,10 +82,14 @@ node packages/audit/dist/cli.js --export export.json --anchors apps/api/.local/a
 
 ## Tests
 
-`pnpm typecheck && pnpm test`: **56 unit + 97 integration tests** (real server + PostgreSQL). Suites: scenarios,
+`pnpm typecheck && pnpm test`: **59 unit + 126 integration tests** (real server + PostgreSQL). Suites: scenarios,
 security, purchase instructions (adversarial), payments lifecycle, valid-session risk, supplier assurance, audit
-anchoring (incl. a full-history-rewrite attack), cross-agent concurrency. Key controls were mutation-checked: breaking
-them makes tests fail.
+anchoring (incl. a full-history-rewrite attack), cross-agent concurrency, self-service sandbox (incl. tenant
+isolation), TypeScript SDK, OpenAPI drift, hosted-sandbox portal. Key controls were mutation-checked: breaking them
+makes tests fail.
+
+`pnpm build && pnpm test:live`: **13 Python SDK tests** (cross-language signing vectors + live) and both quickstart
+examples against a real API process. CI runs all of it and builds the Docker image.
 
 ## Demo (`pnpm demo`, 17/17)
 
@@ -87,8 +109,12 @@ packages/policy-engine      Pure deterministic decision engine
 packages/identity           Ed25519 keys, request signing, external SignFn
 packages/authorization      Signed tokens binding the complete payment instruction
 packages/audit              Hash chain, Merkle anchoring, independent verifier CLI
-packages/sdk-typescript     Agent (sessions) / admin / platform clients
-docs/                       Architecture, threat model, security, API, database, branching, ADRs
+packages/sdk-typescript     Agent (sessions) / admin / sandbox / platform clients; standalone release bundle
+packages/sdk-python         Python SDK (agenttrust)
+examples/                   Runnable quickstarts (TypeScript, Python)
+demo/video/                 90-second terminal demo (VHS tape) + voice-over
+docs/developer/             Quickstart, Integration Guide, OpenAPI reference, evaluation protocol
+docs/                       Architecture, threat model, security, API, database, branching, hosted sandbox, ADRs
 ```
 
 ## Workflow

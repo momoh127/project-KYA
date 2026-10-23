@@ -144,3 +144,28 @@ flowchart LR
   (supplier, instruction, delegation, policy, agent) lock live authorization rows first and write audit last.
 - **Anchoring:** `AnchorService` writes signed Merkle roots to `ImmutableStorage`. `agenttrust-verify` checks an export
   against anchors read directly from storage.
+
+## v0.4: developer experience and hosted sandbox
+
+```mermaid
+flowchart LR
+    Dev["External developer"] -->|"signup, sandbox key"| SB["Sandbox onboarding\n(SandboxAccountsService)"]
+    SB -->|"same path as operator"| ORG["Isolated org + 3 personas"]
+    Dev -->|"SDK (TS / Python)"| API["AgentTrust API"]
+    Dev -->|"advance (own payments only)"| SIM["Sandbox provider + signed webhook path"]
+    API --> SIM
+    Dev -->|"/docs, /downloads"| PORTAL["DocsController (static, allow-listed)"]
+    OPS["Operator"] -->|"/v1/sandbox/metrics"| FUNNEL["Time-to-first-settled-payment funnel"]
+```
+
+- **No relaxed controls in the sandbox.** Signup reuses `createOrganizationRecords` (also used by the operator
+  endpoint). Personas are ordinary users, so dual control and requester ≠ approver still apply between them.
+- **Sandbox key:** `atsk_sbx_` + 192 random bits, stored as `HMAC(pepper, "sandbox-key:v1:" + key)`, org-scoped,
+  expiring (`SandboxAccount`). It authenticates only the `/v1/sandbox/*` routes, inside the service (`@Public()` for
+  the global guard).
+- **Funnel metrics** are computed from existing records (agents, approved instructions, authorizations,
+  transactions); no extra tracking tables.
+- **SDKs:** the TypeScript SDK is the reference. The Python SDK must reproduce the committed signing vectors.
+  Distribution is a tarball, wheel and sdist served by the sandbox (no public registry yet).
+- **Deployment:** a single Docker image; `NODE_ENV=sandbox`; signing key derived from a platform-generated seed
+  (`signingKeyFromSeed`); `trust proxy` hops configurable for correct per-client throttling.
