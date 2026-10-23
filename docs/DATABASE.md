@@ -70,3 +70,20 @@ Supplier change: Supplier → Authorization rows (invalidation) → AuditChainHe
 No transaction locks an Authorization row and then a Supplier row, so the two paths can't deadlock.
 Reconciliation uses a short **lease** (`Transaction.leaseUntil`) instead of holding locks across provider calls,
 and applies outcomes with conditional updates (exactly once).
+
+## v0.3 additions
+
+| Table | Purpose |
+|---|---|
+| `PurchaseInstruction`, `PurchaseInstructionLine`, `PurchaseInstructionVersion` (append-only) | Approved business intent and its history; exact line CHECK constraints |
+| `Integration` | Scoped ERP machine identities (secret stored as SHA-256) |
+| `Receipt` | Three-way-match confirmations |
+| `InvoiceLine` | Trusted invoice line items (exact totals enforced by CHECK) |
+| `ProviderEvent` | Payment webhooks, unique on (provider, event id) |
+| `SupplierVerification` | Provider-backed account/ownership results |
+| `AuditAnchor` (append-only) | Index of signed Merkle anchors stored in write-once storage |
+
+New states: Transaction `requested, accepted, processing, settled, failed, returned, reversed, unknown,
+reconciliation_required`; Invoice adds `payment_exception`; Supplier `assuranceLevel`.
+
+Updated lock order: `Authorization → Agent → PurchaseInstruction → PurchaseOrder → Invoice → AuditChainHead`.
