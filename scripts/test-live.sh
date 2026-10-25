@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Runs the Python SDK tests: offline signing vectors, then the live suite
-# against a real API process on the TEST database (needs Postgres, `pnpm build`,
-# and Python with `cryptography` + `pytest`).
+# Live checks against a real API process on the TEST database: the Python SDK
+# suite (offline signing vectors + live tests), then both quickstart examples.
+# Needs Postgres, `pnpm build`, and Python with `cryptography` + `pytest`.
 #
-#   PYTHON=python3 scripts/test-python-sdk.sh
+#   PYTHON=python3 scripts/test-live.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -37,3 +37,10 @@ curl -sf "http://127.0.0.1:$PORT/v1/health" >/dev/null || { echo "API did not st
 
 cd packages/sdk-python
 AGENTTRUST_BASE_URL="http://127.0.0.1:$PORT" "$PY" -m pytest -q "$@"
+cd ../..
+
+# The quickstarts are documentation: they must actually run.
+echo "--- examples/quickstart-python"
+AGENTTRUST_BASE_URL="http://127.0.0.1:$PORT" PYTHONPATH=packages/sdk-python/src "$PY" examples/quickstart-python/quickstart.py
+echo "--- examples/quickstart-typescript"
+AGENTTRUST_BASE_URL="http://127.0.0.1:$PORT" pnpm --silent --filter @agenttrust/example-quickstart start

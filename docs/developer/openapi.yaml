@@ -1,0 +1,966 @@
+openapi: 3.1.0
+info:
+  title: AgentTrust API (sandbox)
+  version: 0.4.0
+  summary: Authorization for AI agents that initiate business payments.
+  description: |
+    AgentTrust verifies that an AI agent's payment matches what the business actually approved (purchase instruction,
+    supplier, line items, amount, PO/invoice, verified payee, policy) **before** the payment can execute, and the
+    payment gateway enforces that decision.
+
+    **Sandbox only.** No real money moves. Human logins in the sandbox are development tokens. Not production-ready,
+    certified or independently audited.
+
+    ## Three kinds of caller
+    | Caller | Authentication | Can |
+    |---|---|---|
+    | **Agent runtime** | `AgentSignature`: every request Ed25519-signed (workload key → short-lived session keys) | read its own instructions, request authorizations, execute through the gateway |
+    | **Human** (admin / approver / member) | `HumanBearer` | set up suppliers, POs, instructions, invoices; approve; review |
+    | **ERP integration** | `IntegrationBearer` (`itk_<id>.<secret>`) | sync instructions, confirm receipts, write invoices (scoped) |
+
+    Agents can never create, modify or approve purchase instructions, suppliers or invoices.
+
+    ## Conventions
+    - Money is **integer minor units** (`amountCents`). Quantities are **exact decimal strings** (`"2.5"`).
+    - IDs are prefixed (`agt_`, `sup_`, `po_`, `pin_`, `inv_`, `auth_`, `txn_` …).
+    - Errors: `{ "error": { "code", "message", "details?" } }`. **Any non-2xx means not authorized** (fail closed).
+    - Request bodies are strict: unknown fields are rejected with 400.
+
+    ## Agent request signing (AGENTTRUST-ED25519-V1)
+    Headers `x-agenttrust-credential`, `x-agenttrust-timestamp` (unix s), `x-agenttrust-nonce` (16–128 chars,
+    single use), `x-agenttrust-signature` (base64url, no padding) over:
+    ```
+    AGENTTRUST-ED25519-V1\n<METHOD>\n<path incl. query>\n<timestamp>\n<nonce>\n<hex sha256(body bytes)>
+    ```
+    Use the SDKs; the committed test vectors in `packages/identity/test/vectors/` define the format exactly.
+servers:
+  - url: http://localhost:4000
+    description: Local
+tags:
+  - name: Sandbox
+    description: Self-service evaluation (enabled only on sandbox deployments).
+  - name: Agent
+    description: Called by the agent runtime with signed requests.
+  - name: Setup
+    description: Business records created by humans (or ERP) that payments are checked against.
+  - name: Review
+    description: Human review of REVIEW decisions; payment and audit inspection.
+  - name: ERP
+    description: Trusted ERP integration (privileged, scoped machine identity).
+
+paths:
+  /v1/health:
+    get:
+      tags: [Sandbox]
+      summary: Liveness
+      security: []
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { status: { const: ok } } } } } }
+
+  /v1/sandbox/signup:
+    post:
+      tags: [Sandbox]
+      summary: Create a sandbox organization
+      description: |
+        Creates an isolated organization with three personas (`admin` = you, `verifier` = a second administrator for
+        dual control of bank details, `approver`). Returns the **sandbox key once**; it is stored only as a keyed hash.
+        Rate-limited per client and platform-wide.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [organizationName, email]
+              properties:
+                organizationName: { type: string, minLength: 1, maxLength: 200 }
+                email: { type: string, format: email }
+            example: { organizationName: Acme Manufacturing, email: dev@acme.com }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxSignup' }
+        '400': { $ref: '#/components/responses/Invalid' }
+        '404': { description: Sandbox signup is not enabled on this deployment }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: SANDBOX_CAPACITY — daily signup cap reached }
+
+  /v1/sandbox/token:
+    post:
+      tags: [Sandbox]
+      summary: Get a short-lived token for a sandbox persona
+      security: [{ SandboxKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [persona]
+              properties:
+                persona: { type: string, enum: [admin, verifier, approver] }
+      responses:
+        '201':
+          description: "Token (valid 1 hour); use as `Authorization: Bearer <accessToken>`"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken: { type: string }
+                  expiresAt: { type: string, format: date-time }
+                  userId: { type: string }
+                  persona: { type: string }
+                  role: { type: string, enum: [admin, approver] }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { description: SANDBOX_EXPIRED }
+
+  /v1/sandbox/transactions/{id}/advance:
+    post:
+      tags: [Sandbox]
+      summary: Play the payment provider for one of your sandbox payments
+      description: |
+        Moves the sandbox provider's payment along its lifecycle and delivers the provider's **signed webhook**
+        through the normal ingestion path. Only `settled` marks the invoice paid; `returned`/`reversed` never
+        auto-repay. Other organizations' transactions return 404.
+      security: [{ SandboxKey: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [status]
+              properties:
+                status: { type: string, enum: [accepted, processing, settled, failed, returned, reversed] }
+                deliverWebhook: { type: boolean, default: true }
+                duplicateDelivery: { type: boolean, default: false, description: Deliver the same event twice (provider-side duplicate). }
+      responses:
+        '201':
+          description: Advanced
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transactionId: { type: string }
+                  providerStatus: { type: string }
+                  transactionStatus: { $ref: '#/components/schemas/TransactionStatus' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/sandbox/progress:
+    get:
+      tags: [Sandbox]
+      summary: How far this sandbox got through the integration (minutes from signup)
+      security: [{ SandboxKey: [] }]
+      responses:
+        '200':
+          description: Funnel
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  steps:
+                    type: object
+                    description: agentRegistered, instructionApproved, firstAuthorization, firstAllow, firstExecution, firstSettledPayment (null until reached)
+                  minutesToFirstSettledPayment: { type: [number, 'null'] }
+                  completed: { type: boolean }
+
+  /v1/agent-sessions:
+    post:
+      tags: [Agent]
+      summary: Mint a short-lived session key (signed with the WORKLOAD key)
+      description: The only thing a workload credential can do. All other agent calls must be signed by a session key.
+      security: [{ AgentSignature: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [publicKeyPem]
+              properties:
+                publicKeyPem: { type: string, description: Ed25519 SPKI PEM of a freshly generated session key }
+                ttlSeconds: { type: integer, minimum: 60, maximum: 3600, default: 900 }
+      responses:
+        '201':
+          description: "Session; sign subsequent requests with `x-agenttrust-credential: <sessionId>`"
+          content:
+            application/json:
+              schema: { type: object, properties: { sessionId: { type: string }, expiresAt: { type: string, format: date-time } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { description: AGENT_NOT_ACTIVE }
+
+  /v1/agent/purchase-instructions:
+    get:
+      tags: [Agent]
+      summary: List approved purchase instructions assigned to this agent (read-only)
+      security: [{ AgentSignature: [] }]
+      responses:
+        '200':
+          description: Instructions
+          content:
+            application/json:
+              schema: { type: object, properties: { instructions: { type: array, items: { $ref: '#/components/schemas/PurchaseInstruction' } } } }
+
+  /v1/agent/purchase-instructions/{id}:
+    get:
+      tags: [Agent]
+      summary: Get one assigned instruction
+      security: [{ AgentSignature: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Instruction, content: { application/json: { schema: { $ref: '#/components/schemas/PurchaseInstruction' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/authorizations:
+    post:
+      tags: [Agent]
+      summary: Request authorization for a proposed payment
+      description: |
+        Evaluates every rule and returns **ALLOW**, **REVIEW** or **DENY** with reason codes and per-check results.
+        A single-use, short-lived `token` is present only when `status = allowed`. The authorization is bound to the
+        exact payment (supplier record version, payee fingerprint, amount, instruction version and approved lines,
+        policy and delegation); any later change to those records invalidates it.
+        Idempotent on `idempotencyKey`.
+      security: [{ AgentSignature: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAuthorization' }
+            example:
+              idempotencyKey: buy-drills-0001
+              action: purchase
+              supplierId: sup_0123456789abcdef0123456789abcdef
+              payee: { type: us_ach, routingNumber: '021000021', accountNumber: '4000123456' }
+              amountCents: 48000
+              currency: USD
+              purchaseOrderId: po_0123456789abcdef0123456789abcdef
+              invoiceId: inv_0123456789abcdef0123456789abcdef
+              purchaseInstructionId: pin_0123456789abcdef0123456789abcdef
+      responses:
+        '201': { description: Decision (ALLOW / REVIEW / DENY are all 201), content: { application/json: { schema: { $ref: '#/components/schemas/Authorization' } } } }
+        '400': { $ref: '#/components/responses/Invalid' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { description: Agent not active, or a workload (not session) key was used }
+    get:
+      tags: [Review]
+      summary: List authorizations (e.g. the REVIEW queue)
+      security: [{ HumanBearer: [] }]
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [allowed, pending_review, denied, rejected, consumed, expired] } }
+      responses:
+        '200': { description: Authorizations, content: { application/json: { schema: { type: object, properties: { authorizations: { type: array, items: { $ref: '#/components/schemas/Authorization' } } } } } } }
+
+  /v1/authorizations/{id}:
+    get:
+      tags: [Agent, Review]
+      summary: Get an authorization (agent or human)
+      security: [{ AgentSignature: [] }, { HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Authorization, content: { application/json: { schema: { $ref: '#/components/schemas/Authorization' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/authorizations/{id}/approve:
+    post:
+      tags: [Review]
+      summary: Approve a REVIEW decision (re-evaluates every rule first)
+      description: Requires role admin/approver, recent authentication and spending authority ≥ amount. Supplier/payee problems are never approvable (409 NOT_APPROVABLE).
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/Comment' } } } }
+      responses:
+        '201': { description: Updated authorization (token present if now allowed), content: { application/json: { schema: { $ref: '#/components/schemas/Authorization' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/authorizations/{id}/deny:
+    post:
+      tags: [Review]
+      summary: Deny a REVIEW decision
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/Comment' } } } }
+      responses:
+        '201': { description: Updated authorization, content: { application/json: { schema: { $ref: '#/components/schemas/Authorization' } } } }
+
+  /v1/transactions/execute:
+    post:
+      tags: [Agent]
+      summary: Execute an authorized payment through the enforcing gateway
+      description: |
+        The **only** path from an agent to money. Consumes the single-use token atomically, re-checks the binding
+        (records unchanged), compares `expected` with the authorization, and calls the payment provider with an
+        idempotency key.
+
+        **200** = final (`settled`, `failed`, `returned`, `reversed`). **202** = in flight (`accepted`, `processing`,
+        `unknown`, `reconciliation_required`): provider acceptance is **not** payment. Never treat 202 as failure and
+        never request a new authorization to "try again": retry this call with the same token (it reconciles, never
+        re-pays) or poll `GET /v1/transactions/{id}`.
+      security: [{ AgentSignature: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token, expected]
+              properties:
+                token: { type: string }
+                expected:
+                  type: object
+                  additionalProperties: false
+                  description: What the caller believes it is paying. Any mismatch with the authorization fails.
+                  required: [supplierId, amountCents, currency, purchaseOrderId, invoiceId]
+                  properties:
+                    supplierId: { type: [string, 'null'] }
+                    amountCents: { type: integer, minimum: 1 }
+                    currency: { type: string, pattern: '^[A-Z]{3}$' }
+                    purchaseOrderId: { type: [string, 'null'] }
+                    invoiceId: { type: [string, 'null'] }
+      responses:
+        '200': { description: Final outcome, content: { application/json: { schema: { $ref: '#/components/schemas/Transaction' } } } }
+        '202': { description: In flight, content: { application/json: { schema: { $ref: '#/components/schemas/Transaction' } } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { description: Token invalid, expired, already used, bound records changed, or expected mismatch }
+        '409': { description: Conflict (e.g. authorization invalidated) }
+
+  /v1/transactions/{id}:
+    get:
+      tags: [Agent, Review]
+      summary: Get a transaction
+      security: [{ AgentSignature: [] }, { HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Transaction, content: { application/json: { schema: { $ref: '#/components/schemas/Transaction' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/users:
+    get:
+      tags: [Setup]
+      summary: List users (admin)
+      security: [{ HumanBearer: [] }]
+      responses:
+        '200': { description: Users, content: { application/json: { schema: { type: object, properties: { users: { type: array, items: { $ref: '#/components/schemas/User' } } } } } } }
+    post:
+      tags: [Setup]
+      summary: Create a user (admin; cannot grant more authority than you hold)
+      security: [{ HumanBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email, role]
+              properties:
+                email: { type: string, format: email }
+                role: { type: string, enum: [admin, approver, member] }
+                spendingAuthorityCents: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '201': { description: User, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+
+  /v1/agents:
+    post:
+      tags: [Setup]
+      summary: Register an agent with its workload public key (admin)
+      security: [{ HumanBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, ownerUserId, publicKeyPem]
+              properties:
+                name: { type: string, maxLength: 200 }
+                description: { type: string, maxLength: 2000 }
+                ownerUserId: { type: string, description: The accountable human for this agent }
+                publicKeyPem: { type: string, description: Ed25519 SPKI PEM. The private key stays with the agent's key holder. }
+                credentialExpiresAt: { type: string, format: date-time }
+      responses:
+        '201':
+          description: Registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent: { $ref: '#/components/schemas/Agent' }
+                  credential: { type: object, properties: { id: { type: string, description: 'akc_… workload credential id' }, expiresAt: { type: [string, 'null'] } } }
+    get:
+      tags: [Setup]
+      summary: List agents
+      security: [{ HumanBearer: [] }]
+      responses:
+        '200': { description: Agents, content: { application/json: { schema: { type: object, properties: { agents: { type: array, items: { $ref: '#/components/schemas/Agent' } } } } } } }
+
+  /v1/agents/{id}:
+    get:
+      tags: [Setup]
+      summary: Get an agent and its credentials
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Agent, content: { application/json: { schema: { $ref: '#/components/schemas/Agent' } } } }
+
+  /v1/agents/{id}/revoke:
+    post:
+      tags: [Setup]
+      summary: Kill switch — a revoked agent can never transact again (admin)
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { reason: { type: string, maxLength: 500 } } } } } }
+      responses:
+        '201': { description: Revoked, content: { application/json: { schema: { $ref: '#/components/schemas/Agent' } } } }
+
+  /v1/delegations:
+    post:
+      tags: [Setup]
+      summary: Grant an agent a spending ceiling (admin/approver)
+      description: A delegation is a ceiling, never a purchase approval. ALLOW additionally requires an approved purchase instruction.
+      security: [{ HumanBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [agentId, actions, maxTransactionCents, monthlyLimitCents, currency, expiresAt]
+              properties:
+                agentId: { type: string }
+                actions: { type: array, items: { const: purchase }, minItems: 1 }
+                maxTransactionCents: { type: integer, minimum: 1 }
+                monthlyLimitCents: { type: integer, minimum: 1 }
+                currency: { type: string, pattern: '^[A-Z]{3}$' }
+                approvedSupplierIds: { type: [array, 'null'], items: { type: string }, description: null = any verified supplier }
+                validFrom: { type: string, format: date-time }
+                expiresAt: { type: string, format: date-time }
+      responses:
+        '201': { description: Delegation, content: { application/json: { schema: { type: object, properties: { id: { type: string } } } } } }
+        '403': { description: Exceeds the granting human's own spending authority }
+
+  /v1/suppliers:
+    post:
+      tags: [Setup]
+      summary: Enter a supplier and its bank details (admin)
+      description: Bank details are stored as a peppered fingerprint plus last 4. A supplier is not payable until a **different** administrator verifies the destination.
+      security: [{ HumanBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 200 }
+                legalName: { type: string, maxLength: 300 }
+                externalReference: { type: string, maxLength: 200 }
+                paymentDestination: { $ref: '#/components/schemas/PaymentDestination' }
+      responses:
+        '201': { description: Supplier, content: { application/json: { schema: { $ref: '#/components/schemas/Supplier' } } } }
+    get:
+      tags: [Setup]
+      summary: List suppliers
+      security: [{ HumanBearer: [] }]
+      responses:
+        '200': { description: Suppliers, content: { application/json: { schema: { type: object, properties: { suppliers: { type: array, items: { $ref: '#/components/schemas/Supplier' } } } } } } }
+
+  /v1/suppliers/{id}:
+    get:
+      tags: [Setup]
+      summary: Get a supplier
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Supplier, content: { application/json: { schema: { $ref: '#/components/schemas/Supplier' } } } }
+
+  /v1/suppliers/{id}/verify-payment-destination:
+    post:
+      tags: [Setup]
+      summary: Verify bank details out of band (a DIFFERENT admin; step-up auth)
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [evidence, confirmedLast4]
+              properties:
+                evidence: { type: string, minLength: 20, maxLength: 2000, description: How ownership was confirmed, e.g. called AP at the number on the signed contract }
+                confirmedLast4: { type: string, pattern: '^[A-Z0-9]{4}$' }
+      responses:
+        '201': { description: Verified supplier, content: { application/json: { schema: { $ref: '#/components/schemas/Supplier' } } } }
+        '403': { description: Same person who entered the details, or stale authentication }
+
+  /v1/purchase-orders:
+    post:
+      tags: [Setup]
+      summary: Record an approved purchase order (admin/approver)
+      security: [{ HumanBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [supplierId, externalReference, approvedAmountCents, currency]
+              properties:
+                supplierId: { type: string }
+                externalReference: { type: string, maxLength: 100 }
+                approvedAmountCents: { type: integer, minimum: 1 }
+                currency: { type: string, pattern: '^[A-Z]{3}$' }
+      responses:
+        '201': { description: Purchase order, content: { application/json: { schema: { type: object, properties: { id: { type: string }, status: { type: string } } } } } }
+
+  /v1/purchase-instructions:
+    post:
+      tags: [Setup]
+      summary: Create a purchase instruction (human; pending approval)
+      description: |
+        The independently approved statement of what the business wants bought: which agent, from which supplier,
+        which lines at which prices, up to what amount, how many uses, until when. Must be approved (by a different
+        person) before it can authorize anything. Agents can never write instructions.
+      security: [{ HumanBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstructionInput' }
+      responses:
+        '201': { description: Instruction (pending_approval), content: { application/json: { schema: { $ref: '#/components/schemas/PurchaseInstruction' } } } }
+    get:
+      tags: [Setup]
+      summary: List instructions
+      security: [{ HumanBearer: [] }]
+      parameters:
+        - { name: agentId, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [pending_approval, approved, rejected, revoked] } }
+      responses:
+        '200': { description: Instructions, content: { application/json: { schema: { type: object, properties: { instructions: { type: array, items: { $ref: '#/components/schemas/PurchaseInstruction' } } } } } } }
+
+  /v1/purchase-instructions/{id}:
+    get:
+      tags: [Setup]
+      summary: Get an instruction
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Instruction, content: { application/json: { schema: { $ref: '#/components/schemas/PurchaseInstruction' } } } }
+
+  /v1/purchase-instructions/{id}/approve:
+    post:
+      tags: [Setup]
+      summary: Approve an instruction (admin/approver; not the requester; step-up auth)
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/Comment' } } } }
+      responses:
+        '201': { description: Approved, content: { application/json: { schema: { $ref: '#/components/schemas/PurchaseInstruction' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/purchase-instructions/{id}/revoke:
+    post:
+      tags: [Setup]
+      summary: Revoke an instruction (invalidates live authorizations)
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, minLength: 3 } } } } } }
+      responses:
+        '201': { description: Revoked, content: { application/json: { schema: { $ref: '#/components/schemas/PurchaseInstruction' } } } }
+
+  /v1/invoices:
+    post:
+      tags: [Setup]
+      summary: Record a trusted invoice (human or ERP with invoices:write)
+      description: Lines are the trusted line items as recorded by AP/ERP and must sum exactly to `amountCents`.
+      security: [{ HumanBearer: [] }, { IntegrationBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [supplierId, invoiceNumber, amountCents, currency]
+              properties:
+                supplierId: { type: string }
+                purchaseOrderId: { type: string }
+                purchaseInstructionId: { type: string }
+                invoiceNumber: { type: string, maxLength: 100 }
+                amountCents: { type: integer, minimum: 1 }
+                currency: { type: string, pattern: '^[A-Z]{3}$' }
+                documentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+                lines:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [lineNumber, description, quantity, unitPriceCents]
+                    properties:
+                      lineNumber: { type: integer, minimum: 1 }
+                      instructionLineNumber: { type: integer, minimum: 1 }
+                      sku: { type: string }
+                      description: { type: string }
+                      quantity: { type: string, example: '4' }
+                      unitPriceCents: { type: integer, minimum: 0 }
+      responses:
+        '201': { description: Invoice, content: { application/json: { schema: { type: object, properties: { id: { type: string }, status: { type: string } } } } } }
+
+  /v1/invoices/{id}:
+    get:
+      tags: [Setup]
+      summary: Get an invoice (status `paid` only after settlement)
+      security: [{ HumanBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Invoice, content: { application/json: { schema: { type: object, properties: { id: { type: string }, status: { type: string } } } } } }
+
+  /v1/receipts:
+    post:
+      tags: [Setup]
+      summary: Confirm goods received / service completed (three-way matching)
+      security: [{ HumanBearer: [] }, { IntegrationBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [purchaseInstructionId, type, lines]
+              properties:
+                purchaseInstructionId: { type: string }
+                type: { type: string, enum: [goods_received, service_completed, subscription_activated, digital_delivered] }
+                lines: { type: array, items: { type: object, required: [instructionLineNumber, quantity], properties: { instructionLineNumber: { type: integer }, quantity: { type: string } } } }
+                externalId: { type: string }
+                note: { type: string }
+      responses:
+        '201': { description: Receipt, content: { application/json: { schema: { type: object, properties: { id: { type: string } } } } } }
+
+  /v1/integrations/erp/purchase-instructions:
+    post:
+      tags: [ERP]
+      summary: Sync a purchase instruction from a trusted ERP (scope instructions:sync)
+      description: |
+        Sync is **not** approval. ERP-side approval counts only if the integration was deliberately granted
+        `instructions:attest_approval` and the payload carries approvedBy/approvedAt. Stale `externalUpdatedAt` is
+        rejected; material changes create a new version and invalidate live authorizations.
+      security: [{ IntegrationBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: '#/components/schemas/InstructionInput' }
+                - type: object
+                  required: [externalId, externalVersion, externalUpdatedAt, erpApproval]
+                  properties:
+                    externalId: { type: string }
+                    externalVersion: { type: string }
+                    externalUpdatedAt: { type: string, format: date-time }
+                    erpApproval:
+                      type: object
+                      required: [status]
+                      properties:
+                        status: { type: string, enum: [approved, pending, rejected] }
+                        approvedBy: { type: string }
+                        approvedAt: { type: string, format: date-time }
+      responses:
+        '201': { description: Synced instruction, content: { application/json: { schema: { $ref: '#/components/schemas/PurchaseInstruction' } } } }
+
+  /v1/audit/verify:
+    get:
+      tags: [Review]
+      summary: Recompute the organization's audit hash chain and signatures (admin)
+      security: [{ HumanBearer: [] }]
+      responses:
+        '200': { description: Result, content: { application/json: { schema: { type: object, properties: { valid: { type: boolean } } } } } }
+
+components:
+  securitySchemes:
+    AgentSignature:
+      type: apiKey
+      in: header
+      name: x-agenttrust-signature
+      description: Ed25519 request signature plus x-agenttrust-credential, x-agenttrust-timestamp, x-agenttrust-nonce (see top of document). Use an SDK.
+    HumanBearer:
+      type: http
+      scheme: bearer
+      description: Identity-provider access token (sandbox persona token from /v1/sandbox/token).
+    IntegrationBearer:
+      type: http
+      scheme: bearer
+      description: '`itk_<integrationId>.<secret>` for a scoped ERP integration.'
+    SandboxKey:
+      type: apiKey
+      in: header
+      name: x-agenttrust-sandbox-key
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    Invalid: { description: INVALID_REQUEST (validation; unknown fields), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Unauthenticated: { description: UNAUTHENTICATED, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Forbidden (role, separation of duties, authority, stale auth), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: NOT_FOUND (also returned for other organizations' ids), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    RateLimited: { description: RATE_LIMITED, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
+
+    PaymentDestination:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, routingNumber, accountNumber]
+          properties:
+            type: { const: us_ach }
+            routingNumber: { type: string }
+            accountNumber: { type: string }
+        - type: object
+          additionalProperties: false
+          required: [type, iban]
+          properties:
+            type: { const: iban }
+            iban: { type: string }
+
+    Comment:
+      type: object
+      additionalProperties: false
+      properties:
+        comment: { type: string, maxLength: 1000 }
+
+    SandboxSignup:
+      type: object
+      properties:
+        environment: { const: sandbox }
+        organizationId: { type: string }
+        organizationName: { type: string }
+        sandboxKey: { type: string, description: 'atsk_sbx_… — shown once' }
+        expiresAt: { type: string, format: date-time }
+        personas:
+          type: object
+          properties:
+            admin: { $ref: '#/components/schemas/Persona' }
+            verifier: { $ref: '#/components/schemas/Persona' }
+            approver: { $ref: '#/components/schemas/Persona' }
+        policy: { type: object, properties: { id: { type: string }, version: { type: integer } } }
+        notice: { type: string }
+
+    Persona:
+      type: object
+      properties:
+        id: { type: string }
+        email: { type: string }
+        role: { type: string }
+
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        organizationId: { type: string }
+        email: { type: string }
+        role: { type: string, enum: [admin, approver, member] }
+        status: { type: string }
+        spendingAuthorityCents: { type: integer }
+        createdAt: { type: string, format: date-time }
+
+    Agent:
+      type: object
+      properties:
+        id: { type: string }
+        organizationId: { type: string }
+        ownerUserId: { type: string }
+        name: { type: string }
+        status: { type: string, enum: [active, suspended, revoked] }
+        createdAt: { type: string, format: date-time }
+
+    Supplier:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        version: { type: integer, description: Increments on every change; authorizations bind to it }
+        verificationStatus: { type: string }
+        assuranceLevel: { type: string, enum: [recorded, reviewed, account_verified, ownership_verified] }
+        status: { type: string, enum: [active, blocked] }
+        paymentDestination: { type: [object, 'null'], properties: { type: { type: string }, last4: { type: string } } }
+        verifiedAt: { type: [string, 'null'], format: date-time }
+
+    InstructionLine:
+      type: object
+      additionalProperties: false
+      required: [lineNumber, description, quantity, unitPriceCents]
+      properties:
+        lineNumber: { type: integer, minimum: 1, maximum: 999 }
+        sku: { type: string }
+        description: { type: string, maxLength: 500 }
+        unit: { type: string }
+        quantity: { type: string, description: 'Exact decimal, up to 3 places', example: '4' }
+        unitPriceCents: { type: integer, minimum: 0 }
+
+    InstructionInput:
+      type: object
+      required: [agentId, supplierId, fulfillmentType, currency, lines, expiresAt]
+      properties:
+        agentId: { type: string }
+        supplierId: { type: string }
+        purchaseOrderId: { type: string }
+        fulfillmentType: { type: string, enum: [physical_goods, services, subscription, digital_goods] }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        lines: { type: array, minItems: 1, maxItems: 100, items: { $ref: '#/components/schemas/InstructionLine' } }
+        maxAmountCents: { type: integer, description: Defaults to the lines total; may be lower, never higher }
+        maxUses: { type: integer, minimum: 1, maximum: 100, default: 1 }
+        validFrom: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time, description: At most 366 days ahead }
+        description: { type: string, maxLength: 1000 }
+
+    PurchaseInstruction:
+      type: object
+      properties:
+        id: { type: string }
+        version: { type: integer }
+        status: { type: string, enum: [pending_approval, approved, rejected, revoked] }
+        source: { type: string, enum: [human, erp] }
+        agentId: { type: string }
+        supplierId: { type: string }
+        purchaseOrderId: { type: [string, 'null'] }
+        fulfillmentType: { type: string }
+        currency: { type: string }
+        maxAmountCents: { type: integer }
+        maxUses: { type: integer }
+        expiresAt: { type: string, format: date-time }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              lineNumber: { type: integer }
+              sku: { type: [string, 'null'] }
+              description: { type: string }
+              quantity: { type: string }
+              unitPriceCents: { type: integer }
+              lineTotalCents: { type: integer }
+
+    CreateAuthorization:
+      type: object
+      additionalProperties: false
+      required: [idempotencyKey, action, payee, amountCents, currency]
+      properties:
+        idempotencyKey: { type: string, minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9_\-:.]+$', description: Retrying with the same key returns the same authorization }
+        action: { const: purchase }
+        supplierId: { type: string, description: Omit for an unknown payee (REVIEW or DENY) }
+        payee: { $ref: '#/components/schemas/PaymentDestination' }
+        amountCents: { type: integer, minimum: 1 }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        purchaseOrderId: { type: string }
+        invoiceId: { type: string }
+        purchaseInstructionId: { type: string, description: Required for ALLOW }
+        lines:
+          type: array
+          description: Lines being bought; used only when the invoice has no lines
+          items:
+            type: object
+            required: [instructionLineNumber, quantity, unitPriceCents]
+            properties:
+              instructionLineNumber: { type: integer }
+              sku: { type: string }
+              quantity: { type: string }
+              unitPriceCents: { type: integer }
+
+    CheckResult:
+      type: object
+      properties:
+        code: { $ref: '#/components/schemas/ReasonCode' }
+        outcome: { type: string, enum: [pass, review, deny] }
+        message: { type: string }
+        approvable: { type: boolean, description: For review outcomes, whether a human may resolve it (payee/supplier problems never are) }
+
+    Authorization:
+      type: object
+      properties:
+        id: { type: string }
+        agentId: { type: string }
+        decision: { type: string, enum: [ALLOW, REVIEW, DENY] }
+        status: { type: string, enum: [allowed, pending_review, denied, rejected, consumed, expired, invalidated] }
+        reasonCodes: { type: array, items: { $ref: '#/components/schemas/ReasonCode' } }
+        checks: { type: array, items: { $ref: '#/components/schemas/CheckResult' } }
+        approvable: { type: boolean, description: Whether a human may approve this REVIEW item }
+        transactionFingerprint: { type: string }
+        authorizationFingerprint: { type: [string, 'null'] }
+        invalidatedReason: { type: [string, 'null'] }
+        amountCents: { type: integer }
+        currency: { type: string }
+        supplierId: { type: [string, 'null'] }
+        purchaseOrderId: { type: [string, 'null'] }
+        invoiceId: { type: [string, 'null'] }
+        purchaseInstructionId: { type: [string, 'null'] }
+        instructionVersion: { type: [integer, 'null'] }
+        expiresAt: { type: string, format: date-time }
+        token: { type: string, description: Present only while status = allowed. Single use, short lived. }
+
+    TransactionStatus:
+      type: string
+      enum: [requested, accepted, processing, settled, failed, returned, reversed, unknown, reconciliation_required]
+      description: Only `settled` means money moved and the invoice is paid.
+
+    Transaction:
+      type: object
+      properties:
+        id: { type: string }
+        authorizationId: { type: string }
+        status: { $ref: '#/components/schemas/TransactionStatus' }
+        amountCents: { type: integer }
+        currency: { type: string }
+        supplierId: { type: [string, 'null'] }
+        invoiceId: { type: [string, 'null'] }
+        provider: { type: string }
+        providerIdempotencyKey: { type: string }
+        providerReference: { type: [string, 'null'] }
+        attempts: { type: integer }
+        acceptedAt: { type: [string, 'null'], format: date-time }
+        settledAt: { type: [string, 'null'], format: date-time }
+        retried: { type: boolean, description: True when this response came from reconciling an earlier attempt }
+
+    ReasonCode:
+      type: string
+      description: Machine-readable reason. Full list in packages/shared/src/decision.ts.
+      examples: [INSTRUCTION_MATCHED, PAYEE_MISMATCH, INVOICE_ALREADY_PAID, AMOUNT_EXCEEDS_INSTRUCTION, SUPPLIER_UNKNOWN, LINE_ITEM_MISMATCH, RISK_RECENT_PAYEE_CHANGE]
