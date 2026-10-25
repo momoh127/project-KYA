@@ -32,6 +32,13 @@ jobs:
       - run: pnpm typecheck
       # Security-critical tests: any failure blocks merge/release.
       - run: pnpm test
+      # Python SDK: cross-language signing vectors + live suite against the built API.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install "cryptography>=41" "pytest>=8"
+      - run: pnpm build
+      - run: PYTHON=python pnpm test:python
 
   # Releases to main must come from release/* or hotfix/* branches.
   main-source-guard:
