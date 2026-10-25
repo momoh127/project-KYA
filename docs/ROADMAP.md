@@ -24,7 +24,27 @@ enforcing gateway; approvals; race-free budgets; duplicate protection; signed ha
 - Cross-agent concurrency tests; branching workflow (main = production)
 - 153 automated tests; 17-scenario live demo
 
+**v0.4: developer experience** (goal: external developer ≤ 30 min to a settled sandbox payment, measured):
+- Hosted sandbox: self-service signup (admin/verifier/approver personas), org-scoped provider simulation,
+  time-to-first-payment funnel metrics; Docker image + Render blueprint; portal at `/docs`, SDK downloads
+- TypeScript SDK (typed admin + sandbox clients, zero-dependency release bundle) and Python SDK (`agenttrust`),
+  sharing committed signing test vectors
+- OpenAPI 3.1 reference with a drift test; Quickstart; Integration Guide; evaluation protocol; runnable examples in CI
+- 90-second terminal demo video + voice-over; GitHub rulesets versioned (enforcement deferred: plan limitation)
+- 59 unit + 126 integration + 13 Python tests; both quickstarts run live in CI
+
 ## Next
+
+Decided by design-partner evidence, not by us. Candidates, in the order we expect to need them:
+
+| Signal from design partners | Then build |
+|---|---|
+| "We own the payment call" (expected to be common) | **Pattern B:** verify-and-consume API for the customer's payment service + outcome reporting |
+| "Our approvals live in NetSuite / Coupa / Slack" | First real instruction source connector (ERP sync exists; add one concrete integration) |
+| "We'd go live on rail X" | First real payment adapter behind `PaymentAdapter` (no real money until the production items below exist) |
+| Integration takes > 30 min | Fix the top confusion point after every evaluation session |
+
+Before any real money (unchanged from v0.3):
 
 | Priority | Item | Why |
 |---|---|---|

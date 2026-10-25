@@ -117,3 +117,20 @@ Decision reason codes are defined in [`packages/shared/src/decision.ts`](../pack
 `POST /v1/authorizations` accepts `purchaseInstructionId` and optional `lines`
 `[{ instructionLineNumber, sku?, quantity: "2.5", unitPriceCents }]`. Execute returns **202** while a payment is
 `requested`/`accepted`/`processing`/`unknown`. Only `settled` (200) means paid.
+
+## v0.4 endpoints (hosted sandbox and developer portal)
+
+The public integration surface is specified in [`docs/developer/openapi.yaml`](developer/openapi.yaml) (OpenAPI 3.1,
+kept in sync with the application by `apps/api/test/openapi.test.ts`).
+
+| Method & path | Caller | Purpose |
+|---|---|---|
+| `POST /v1/sandbox/signup` | public (throttled, daily cap) | New sandbox org with admin / verifier / approver personas; sandbox key shown once |
+| `POST /v1/sandbox/token` | `x-agenttrust-sandbox-key` | 1-hour token for one persona |
+| `POST /v1/sandbox/transactions/:id/advance` | sandbox key (own org only) | Play the provider: settle / fail / return / reverse via the signed-webhook path |
+| `GET /v1/sandbox/progress` | sandbox key | Integration funnel with minutes from signup |
+| `GET /v1/sandbox/metrics` | platform (bootstrap) | Funnel across all sandboxes; median minutes to first settled payment |
+| `GET /`, `GET /docs`, `GET /docs/{quickstart,integration-guide,evaluation,reference,openapi.yaml}` | public (`AGENTTRUST_PUBLIC_DOCS=true`) | Developer portal |
+| `GET /downloads/:file` | public (`AGENTTRUST_PUBLIC_DOCS=true`) | Allow-listed SDK artifacts (TS tarball, Python wheel/sdist) |
+
+All sandbox routes return 404 unless `AGENTTRUST_SANDBOX_SIGNUP=true` (refused when `NODE_ENV=production`).
