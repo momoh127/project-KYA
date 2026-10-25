@@ -12,3 +12,4 @@ coverage/
 *.pem
 *.key
 dist-sdk/
+demo/video/out/

@@ -5,6 +5,7 @@
   "license": "UNLICENSED",
   "scripts": {
     "start": "node --env-file=../../.env --import tsx src/main.ts",
+    "video": "node --import tsx src/video.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
