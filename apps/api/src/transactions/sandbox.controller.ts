@@ -12,7 +12,7 @@ import { PaymentEventsService } from './payment-events.service';
 import type { ObservedStatus } from './lifecycle';
 
 const FaultsBody = z.object({ faults: z.array(z.enum(SANDBOX_FAULTS)).min(1).max(20) }).strict();
-const AdvanceBody = z
+export const AdvanceBody = z
   .object({
     status: z.enum(SANDBOX_LIFECYCLE as [ObservedStatus, ...ObservedStatus[]]),
     /** Deliver a signed webhook for this change (otherwise only status queries will see it). */
@@ -21,6 +21,35 @@ const AdvanceBody = z
     duplicateDelivery: z.boolean().default(false),
   })
   .strict();
+
+/**
+ * Moves a sandbox provider payment along its lifecycle and (optionally)
+ * delivers the provider's signed webhook through the normal ingestion path,
+ * exactly as an external provider would. Shared by the operator endpoint and
+ * the org-scoped self-service sandbox endpoint.
+ */
+export async function advanceSandboxPayment(
+  sandbox: SandboxPaymentAdapter,
+  events: PaymentEventsService,
+  config: AppConfig,
+  idempotencyKey: string,
+  body: z.infer<typeof AdvanceBody>,
+) {
+  const updated = await sandbox.advance(idempotencyKey, body.status);
+  if (!updated) throw Errors.notFound('Sandbox payment');
+  const deliveries: Awaited<ReturnType<PaymentEventsService['ingest']>>[] = [];
+  if (body.deliverWebhook) {
+    if (!config.sandboxWebhookSecret) throw Errors.unavailable('Webhook secret not configured');
+    const signed = sandbox.signEvent(config.sandboxWebhookSecret, {
+      id: newId('evt_sbx'), type: `payment.${body.status}`,
+      data: { idempotencyKey, providerReference: updated.providerReference, status: body.status },
+    });
+    for (let i = 0; i < (body.duplicateDelivery ? 2 : 1); i++) {
+      deliveries.push(await events.ingest('sandbox', Buffer.from(signed.body), signed.signature));
+    }
+  }
+  return { providerStatus: updated.status, deliveries };
+}
 
 /** Payment-provider webhooks. Authenticated by the provider's signature, not by our credentials. */
 @Controller('v1/webhooks/payments')
@@ -64,21 +93,7 @@ export class SandboxController {
   @Post('payments/:idempotencyKey/advance')
   @Bootstrap()
   async advance(@Param('idempotencyKey') key: string, @Body(new ZodPipe(AdvanceBody)) body: z.infer<typeof AdvanceBody>) {
-    const sandbox = this.sandbox();
-    const updated = await sandbox.advance(key, body.status);
-    if (!updated) throw Errors.notFound('Sandbox payment');
-    const deliveries: unknown[] = [];
-    if (body.deliverWebhook) {
-      if (!this.config.sandboxWebhookSecret) throw Errors.unavailable('Webhook secret not configured');
-      const signed = sandbox.signEvent(this.config.sandboxWebhookSecret, {
-        id: newId('evt_sbx'), type: `payment.${body.status}`,
-        data: { idempotencyKey: key, providerReference: updated.providerReference, status: body.status },
-      });
-      for (let i = 0; i < (body.duplicateDelivery ? 2 : 1); i++) {
-        deliveries.push(await this.events.ingest('sandbox', Buffer.from(signed.body), signed.signature));
-      }
-    }
-    return { providerStatus: updated.status, deliveries };
+    return advanceSandboxPayment(this.sandbox(), this.events, this.config, key, body);
   }
 
   @Get('payments/:idempotencyKey')

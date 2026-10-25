@@ -1,12 +1,12 @@
 import { Body, Controller, Get, Param, Post } from '@nestjs/common';
 import { z } from 'zod';
-import { DEFAULT_POLICY_RULES } from '@agenttrust/policy-engine';
 import { IdPrefix, newId } from '@agenttrust/shared';
 import { Bootstrap, CurrentUser, Human, type HumanPrincipal } from '../auth/principal';
 import { AuditService } from '../audit/audit.service';
 import { Errors } from '../common/errors';
 import { cents, PrismaService } from '../common/prisma.service';
 import { zCents, ZodPipe } from '../common/validation';
+import { createOrganizationRecords } from './create-organization';
 
 const CreateOrg = z
   .object({
@@ -38,35 +38,9 @@ export class OrganizationsController {
   @Post('organizations')
   @Bootstrap()
   async create(@Body(new ZodPipe(CreateOrg)) body: z.infer<typeof CreateOrg>) {
-    const orgId = newId(IdPrefix.organization);
-    const userId = newId(IdPrefix.user);
-    const policyId = newId(IdPrefix.policy);
-
     return this.prisma.tx(async (tx) => {
-      const org = await tx.organization.create({ data: { id: orgId, name: body.name } });
-      const admin = await tx.user.create({
-        data: {
-          id: userId,
-          organizationId: orgId,
-          externalIdentityId: `dev|${userId}`,
-          email: body.admin.email,
-          role: 'admin',
-          spendingAuthorityCents: BigInt(body.admin.spendingAuthorityCents),
-        },
-      });
-      await tx.policy.create({
-        data: { id: policyId, organizationId: orgId, name: 'Default purchasing policy', version: 1, rules: JSON.parse(JSON.stringify(DEFAULT_POLICY_RULES)), status: 'active' },
-      });
-      await tx.auditChainHead.create({ data: { organizationId: orgId } });
-      await this.audit.append(tx, {
-        organizationId: orgId,
-        actorType: 'system',
-        actorId: 'platform',
-        eventType: 'organization.created',
-        subjectId: orgId,
-        payload: { name: body.name, adminUserId: userId, policyId, policyVersion: 1 },
-      });
-      return { organization: org, admin: serializeUser(admin), policy: { id: policyId, version: 1 } };
+      const { org, admin, policy } = await createOrganizationRecords(tx, this.audit, { ...body, createdBy: 'platform' });
+      return { organization: org, admin: serializeUser(admin), policy };
     });
   }
 

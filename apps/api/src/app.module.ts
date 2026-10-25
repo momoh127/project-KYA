@@ -32,6 +32,8 @@ import { PAYMENT_ADAPTER, SandboxPaymentAdapter } from './transactions/payment-a
 import { ReconcilerService } from './transactions/reconciler.service';
 import { PaymentEventsService } from './transactions/payment-events.service';
 import { SandboxController, WebhooksController } from './transactions/sandbox.controller';
+import { SandboxOnboardingController } from './sandbox/sandbox.controller';
+import { SandboxAccountsService } from './sandbox/sandbox-accounts.service';
 import { TransactionsController } from './transactions/transactions.controller';
 import { TransactionsService } from './transactions/transactions.service';
 
@@ -56,6 +58,7 @@ export class AppModule {
         AuthorizationsController,
         TransactionsController,
         SandboxController,
+        SandboxOnboardingController,
         WebhooksController,
         AuditController,
       ],
@@ -67,6 +70,7 @@ export class AppModule {
         // Production: S3 Object Lock (compliance mode) adapter in a separate account.
         { provide: IMMUTABLE_STORAGE, inject: [APP_CONFIG], useFactory: (c: AppConfig) => new LocalWriteOnceStorage(c.anchorDir) },
         AnchorService,
+        SandboxAccountsService,
         DevTokenService,
         {
           provide: HUMAN_TOKEN_VERIFIER,
