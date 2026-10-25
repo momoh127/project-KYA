@@ -1,7 +1,7 @@
 import { generateKeyPairSync, type KeyObject } from 'node:crypto';
 import { ed25519Sign, parseEd25519PrivateKey, signRequest, signRequestWith, type SignFn } from '@agenttrust/identity';
+import { send, type FetchFn } from './http';
 import type {
-  ApiErrorBody,
   AuthorizationResponse,
   CreateAuthorizationInput,
   ExecuteTransactionInput,
@@ -19,31 +19,6 @@ export type { SignFn };
 export function localSigner(privateKeyPem: string): SignFn {
   const key = parseEd25519PrivateKey(privateKeyPem);
   return (data: Buffer) => ed25519Sign(key, data);
-}
-
-export class AgentTrustError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-    readonly details?: unknown,
-  ) {
-    super(message);
-    this.name = 'AgentTrustError';
-  }
-}
-
-type FetchFn = typeof fetch;
-
-async function send<T>(fetchFn: FetchFn, url: string, init: RequestInit): Promise<T> {
-  const res = await fetchFn(url, init);
-  const text = await res.text();
-  const body = text ? JSON.parse(text) : undefined;
-  if (!res.ok) {
-    const err = (body as ApiErrorBody | undefined)?.error;
-    throw new AgentTrustError(res.status, err?.code ?? 'HTTP_ERROR', err?.message ?? res.statusText, err?.details);
-  }
-  return body as T;
 }
 
 export interface AgentClientOptions {
@@ -151,37 +126,6 @@ export class AgentTrust {
       this.request<TransactionResponse>('POST', '/v1/transactions/execute', input),
     get: (id: string) => this.request<TransactionResponse>('GET', `/v1/transactions/${encodeURIComponent(id)}`),
   };
-}
-
-export interface AdminClientOptions {
-  baseUrl: string;
-  /** Human access token from the identity provider (dev: /v1/dev/token). */
-  accessToken: string;
-  fetch?: FetchFn;
-}
-
-/** Client for human administrators / approvers (dashboard, back-office scripts). */
-export class AgentTrustAdmin {
-  private readonly fetchFn: FetchFn;
-
-  constructor(private readonly opts: AdminClientOptions) {
-    this.fetchFn = opts.fetch ?? fetch;
-  }
-
-  request<T>(method: 'GET' | 'POST' | 'PUT' | 'PATCH', path: string, payload?: unknown): Promise<T> {
-    const headers: Record<string, string> = { authorization: `Bearer ${this.opts.accessToken}` };
-    if (payload !== undefined) headers['content-type'] = 'application/json';
-    return send<T>(this.fetchFn, `${this.opts.baseUrl}${path}`, {
-      method,
-      headers,
-      body: payload === undefined ? undefined : JSON.stringify(payload),
-    });
-  }
-
-  get = <T>(path: string) => this.request<T>('GET', path);
-  post = <T>(path: string, payload: unknown = {}) => this.request<T>('POST', path, payload);
-  put = <T>(path: string, payload: unknown) => this.request<T>('PUT', path, payload);
-  patch = <T>(path: string, payload: unknown) => this.request<T>('PATCH', path, payload);
 }
 
 /** Platform-operator helpers (organization bootstrap + development login). */

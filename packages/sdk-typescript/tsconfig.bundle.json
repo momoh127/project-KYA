@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "rootDir": "..",
+    "paths": {
+      "@agenttrust/identity": ["../identity/src/index.ts"],
+      "@agenttrust/shared": ["../shared/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}

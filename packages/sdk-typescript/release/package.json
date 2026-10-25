@@ -1,0 +1,19 @@
+{
+  "name": "@agenttrust/sdk",
+  "version": "0.4.0",
+  "description": "AgentTrust SDK: authorization for AI agents that initiate business payments (sandbox).",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE.md"],
+  "engines": { "node": ">=18.17" },
+  "sideEffects": false
+}
