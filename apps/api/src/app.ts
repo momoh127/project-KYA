@@ -13,6 +13,9 @@ export async function createApp(config: AppConfig, opts: { logger?: boolean } = 
   });
   app.useBodyParser('json', { limit: '64kb' });
   app.disable('x-powered-by');
+  // Behind a load balancer (e.g. Render), trust exactly N proxy hops so rate
+  // limits key on the real client IP, not the proxy's. 0 = trust none.
+  if (config.trustProxyHops > 0) app.set('trust proxy', config.trustProxyHops);
   app.enableShutdownHooks();
   return app;
 }

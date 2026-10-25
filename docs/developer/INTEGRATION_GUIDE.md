@@ -141,9 +141,17 @@ unreadable response. **Treat every error as "not authorized"** and never fall ba
 
 ## 9. Latency
 
-No load testing yet. Measure in the sandbox with your own payloads: time `authorizations.create` and
-`transactions.execute`. Each one is a single round trip and a single database transaction. If your latency budget is
-tight (for example, card authorization windows), tell us your number.
+No load testing yet. One **local lower bound** (sandbox container + Postgres on one laptop, one sequential client,
+simulated provider, 55 measured requests after warm-up, v0.4.0):
+
+| Call | p50 | p95 |
+|---|---|---|
+| `authorizations.create` (full rule evaluation, ALLOW path) | 12 ms | 24 ms |
+| `transactions.execute` (token consume + binding re-check + provider call) | 13 ms | 32 ms |
+
+Expect more in practice: the network round trip to the hosted sandbox, real provider latency, and concurrency. Each
+call is one round trip and one database transaction. If your latency budget is tight (for example, card
+authorization windows), tell us your number. The measurement script is `scripts/bench/latency.mts` (ask us for a copy).
 
 ## 10. Before production (not done in v0.4)
 
